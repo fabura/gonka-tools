@@ -1,0 +1,63 @@
+# Gonka.ai Nodes Configuration
+# ============================
+# Copy this file to nodes.yaml and configure your nodes
+
+nodes:
+  # Example node configuration
+  - name: "gpu-server-1"
+    host: "192.168.1.100"
+    port: 22
+    user: "root"
+    ssh_key: "~/.ssh/id_rsa"
+    # Optional: password auth (not recommended)
+    # password: "your_password"
+    
+    # Node type: "network" or "inference"
+    node_type: "inference"
+    
+    # GPU configuration
+    gpus:
+      - model: "H100"
+        count: 4
+    
+    # Monitoring settings for this node
+    monitoring:
+      enabled: true
+      cpu_threshold: 90
+      memory_threshold: 85
+      disk_threshold: 90
+      gpu_temp_threshold: 85
+    
+    # Custom labels for organization
+    labels:
+      datacenter: "dc1"
+      rack: "r01"
+
+  - name: "gpu-server-2"
+    host: "192.168.1.101"
+    port: 22
+    user: "ubuntu"
+    ssh_key: "~/.ssh/gonka_key"
+    node_type: "inference"
+    gpus:
+      - model: "A100"
+        count: 8
+    monitoring:
+      enabled: true
+    labels:
+      datacenter: "dc2"
+
+# Global settings
+global:
+  # Default SSH settings
+  ssh_timeout: 30
+  connection_retries: 3
+  
+  # Gonka CLI settings
+  inferenced_path: "/usr/local/bin/inferenced"
+  config_dir: "/etc/gonka"
+  data_dir: "/var/lib/gonka"
+  
+  # Auto-update Gonka software
+  auto_update: false
+
