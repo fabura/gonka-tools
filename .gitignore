@@ -1,0 +1,40 @@
+# Environment and secrets
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Exports and data
+exports/
+*.csv
+*.json
+!config/*.json
+!*example*.json
+
+# Logs
+*.log
+logs/
+
+# SSH keys (never commit these!)
+*.pem
+*_key
+id_rsa*
+

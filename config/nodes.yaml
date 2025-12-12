@@ -1,0 +1,44 @@
+# Gonka.ai Nodes Configuration
+# ============================
+
+nodes:
+  - name: "neon-galaxy-fin-01"
+    host: "65.108.33.117"
+    port: 22
+    user: "root"
+    ssh_key: "~/.ssh/gonka_key"
+    
+    # Node type: "network" or "inference"
+    node_type: "inference"
+    
+    # GPU configuration
+    gpus:
+      - model: "RTX A6000"
+        count: 2
+        vram_gb: 48
+    
+    # Gonka account
+    gonka_address: "gonka1k82cpjqhfgt347x7grdudu7zfaew6strzjwhyl"
+    
+    # Monitoring settings
+    monitoring:
+      enabled: true
+      cpu_threshold: 90
+      memory_threshold: 85
+      disk_threshold: 90
+      gpu_temp_threshold: 80
+    
+    # Labels for organization
+    labels:
+      provider: "hetzner"
+      location: "finland"
+      total_vram: "96GB"
+
+# Global settings
+global:
+  ssh_timeout: 30
+  connection_retries: 3
+  inferenced_path: "/usr/local/bin/inferenced"
+  config_dir: "/etc/gonka"
+  data_dir: "/var/lib/gonka"
+  auto_update: false
