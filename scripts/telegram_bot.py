@@ -182,6 +182,57 @@ def get_full_status(name, config):
     return status
 
 
+def get_pow_status(name, config):
+    """Get detailed PoW/PoC status"""
+    status = {
+        "reachable": False,
+        "service_state": "UNKNOWN",
+        "pow_status": "UNKNOWN",
+        "pow_running": False,
+        "inference_running": False,
+        "node_intended": "UNKNOWN",
+        "node_current": "UNKNOWN",
+        "poc_intended": "UNKNOWN",
+        "poc_current": "UNKNOWN",
+        "epoch_models": {},
+    }
+    
+    ok, out = ssh_exec(name, "curl -s http://localhost:8080/health 2>/dev/null", config)
+    if ok and out:
+        try:
+            data = json.loads(out)
+            status["reachable"] = True
+            status["service_state"] = data.get("service_state", "UNKNOWN")
+            status["pow_running"] = data.get("managers", {}).get("pow", {}).get("running", False)
+            status["inference_running"] = data.get("managers", {}).get("inference", {}).get("running", False)
+        except:
+            pass
+    
+    ok, out = ssh_exec(name, "curl -s http://localhost:8080/api/v1/pow/status 2>/dev/null", config)
+    if ok and out:
+        try:
+            data = json.loads(out)
+            status["pow_status"] = data.get("status", "UNKNOWN")
+        except:
+            pass
+    
+    ok, out = ssh_exec(name, "curl -s http://localhost:9200/admin/v1/nodes 2>/dev/null", config)
+    if ok and out:
+        try:
+            data = json.loads(out)
+            if data and len(data) > 0:
+                state = data[0].get("state", {})
+                status["node_intended"] = state.get("intended_status", "UNKNOWN")
+                status["node_current"] = state.get("current_status", "UNKNOWN")
+                status["poc_intended"] = state.get("poc_intended_status", "UNKNOWN")
+                status["poc_current"] = state.get("poc_current_status", "UNKNOWN")
+                status["epoch_models"] = state.get("epoch_models", {})
+        except:
+            pass
+    
+    return status
+
+
 async def get_earnings_info():
     """Get earnings and epoch info from network"""
     info = {
@@ -323,6 +374,7 @@ async def handle_update(update):
 /models - Downloaded models
 /logs - Recent logs
 /restart - Restart services
+/pow - PoW/PoC status
 /report - Send full report
 
 <b>Auto:</b> Reports every 30 min""")
@@ -398,6 +450,47 @@ Epochs completed: {}
             "cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart 2>&1",
             config)
         await send_message(chat_id, "✅ Restart initiated" if ok else "❌ Failed")
+    
+    elif cmd == "/pow":
+        for name, config in NODES.items():
+            p = get_pow_status(name, config)
+            if not p["reachable"]:
+                await send_message(chat_id, "❌ {} offline".format(name))
+                continue
+            
+            state_icon = "🟢" if p["service_state"] == "INFERENCE" else "🟡" if p["service_state"] == "STOPPED" else "🔵"
+            pow_icon = "✅" if p["pow_running"] else "⏸"
+            inf_icon = "✅" if p["inference_running"] else "⏸"
+            
+            models = list(p["epoch_models"].keys()) if p["epoch_models"] else ["None assigned"]
+            
+            await send_message(chat_id, """⚡ <b>PoW/PoC Status</b>
+
+<b>Service State:</b> {} {}
+<b>PoW Status:</b> {}
+
+<b>Managers:</b>
+  {} PoW: {}
+  {} Inference: {}
+
+<b>Node Controller:</b>
+  Intended: {}
+  Current: {}
+  PoC Intended: {}
+  PoC Current: {}
+
+<b>Epoch Models:</b>
+  {}""".format(
+                state_icon, p["service_state"],
+                p["pow_status"],
+                pow_icon, "Running" if p["pow_running"] else "Stopped",
+                inf_icon, "Running" if p["inference_running"] else "Stopped",
+                p["node_intended"],
+                p["node_current"],
+                p["poc_intended"],
+                p["poc_current"],
+                "\n  ".join(models)
+            ))
     
     elif cmd == "/report":
         await send_report()
