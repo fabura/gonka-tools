@@ -1,20 +1,31 @@
 #!/bin/bash
 #
-# Gonka.ai Quick Node Setup Script v3.0
+# Gonka.ai Quick Node Setup Script v3.1
 # =====================================
 # This script sets up a Gonka compute node using Docker Compose.
 #
+# SECURITY: This script creates an ML Ops key (hot wallet) on the server.
+# You should grant permissions from YOUR LOCAL MACHINE using your account key.
+# Never share your account mnemonic with the server!
+#
 # Usage:
-#   # With existing account (provide mnemonic when prompted):
+#   # Run on server:
 #   ./quick_setup.sh
 #
-#   # With environment variables:
-#   export GONKA_MNEMONIC="your 24 word mnemonic..."
-#   export KEYRING_PASSWORD="yourpassword"
-#   ./quick_setup.sh
+#   # After setup, run on YOUR LOCAL MACHINE to grant permissions:
+#   inferenced tx inference grant-ml-ops-permissions \
+#     your-account-key \
+#     <ML_OPS_ADDRESS_FROM_SETUP> \
+#     --from your-account-key \
+#     --keyring-backend file \
+#     --node http://node2.gonka.ai:26657 \
+#     --chain-id gonka-mainnet \
+#     --gas 1000000 -y
 #
-# Optional environment variables:
-#   GONKA_MNEMONIC     - 24-word mnemonic for existing account
+# Required:
+#   ACCOUNT_PUBKEY     - Your account public key (get from: inferenced keys show your-key)
+#
+# Optional:
 #   KEYRING_PASSWORD   - Password for keyring (min 8 chars, default: gonkapass)
 #   SKIP_NVIDIA        - Set to "1" to skip NVIDIA driver installation
 #   SKIP_MODEL_DOWNLOAD - Set to "1" to skip model pre-download
@@ -201,62 +212,31 @@ cd "$GONKA_DIR/deploy/join"
 log_success "Gonka repository ready"
 
 # ============================================================================
-# Step 6: Setup Keys (Account Key + ML Ops Key)
+# Step 6: Setup ML Ops Key (Hot Wallet - safe to keep on server)
 # ============================================================================
-log_step 6 "Setting up keys..."
+log_step 6 "Setting up ML Ops key..."
 
 mkdir -p /root/.inference/keyring-file
 mkdir -p /root/.inference/keyring-test
 
-# Check if we have a mnemonic
-if [ -z "$GONKA_MNEMONIC" ]; then
+# Get account public key (NOT the mnemonic - that stays on your local machine)
+if [ -z "$ACCOUNT_PUBKEY" ]; then
     echo ""
-    log_info "Do you have an existing Gonka account with a mnemonic?"
-    read -p "Enter 24-word mnemonic (or press Enter to create new account): " GONKA_MNEMONIC
+    log_info "Your account public key is needed for node registration."
+    echo "To get it, run this on YOUR LOCAL machine:"
+    echo "  inferenced keys show your-account-name --keyring-backend file"
+    echo "  (Copy the 'key' value from pubkey field)"
+    echo ""
+    read -p "Enter your account PUBLIC KEY (base64 string): " ACCOUNT_PUBKEY
 fi
 
-if [ -n "$GONKA_MNEMONIC" ]; then
-    # Import existing account
-    log_info "Importing account from mnemonic..."
-    
-    # Import to file backend with password using expect
-    expect << EOF
-spawn inferenced keys add gonka-account-key --recover --keyring-backend file
-expect "mnemonic"
-send "$GONKA_MNEMONIC\r"
-expect "passphrase"
-send "$KEYRING_PASSWORD\r"
-expect "passphrase"
-send "$KEYRING_PASSWORD\r"
-expect eof
-EOF
-    
-    ACCOUNT_ADDRESS=$(inferenced keys show gonka-account-key --keyring-backend file -a 2>/dev/null < <(echo "$KEYRING_PASSWORD") || echo "")
-else
-    # Create new account
-    log_info "Creating new Gonka account..."
-    
-    expect << EOF
-spawn inferenced keys add gonka-account-key --keyring-backend file
-expect "passphrase"
-send "$KEYRING_PASSWORD\r"
-expect "passphrase"
-send "$KEYRING_PASSWORD\r"
-expect eof
-EOF
-    
-    log_warn "SAVE YOUR MNEMONIC! It was displayed above."
+if [ -z "$ACCOUNT_PUBKEY" ]; then
+    log_error "Account public key is required!"
+    exit 1
 fi
 
-# Get account info
-ACCOUNT_INFO=$(echo "$KEYRING_PASSWORD" | inferenced keys show gonka-account-key --keyring-backend file 2>/dev/null || echo "")
-ACCOUNT_ADDRESS=$(echo "$ACCOUNT_INFO" | grep "address:" | awk '{print $2}')
-ACCOUNT_PUBKEY=$(echo "$ACCOUNT_INFO" | grep "key:" | sed 's/.*key":"\([^"]*\)".*/\1/')
-
-log_info "Account Address: $ACCOUNT_ADDRESS"
-
-# Create ML Ops Key
-log_info "Creating ML Ops key..."
+# Create ML Ops Key (this is the HOT wallet - safe to keep on server)
+log_info "Creating ML Ops key (hot wallet for node operations)..."
 expect << EOF
 spawn inferenced keys add ml-ops-key --keyring-backend file
 expect "passphrase"
@@ -266,33 +246,55 @@ send "$KEYRING_PASSWORD\r"
 expect eof
 EOF
 
-ML_OPS_ADDRESS=$(echo "$KEYRING_PASSWORD" | inferenced keys show ml-ops-key --keyring-backend file -a 2>/dev/null || echo "")
+# Get ML ops key info
+sleep 2
+ML_OPS_INFO=$(expect << EOF
+spawn inferenced keys show ml-ops-key --keyring-backend file
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect eof
+EOF
+)
+
+ML_OPS_ADDRESS=$(echo "$ML_OPS_INFO" | grep "address:" | awk '{print $2}' | tr -d '\r')
+ML_OPS_PUBKEY=$(echo "$ML_OPS_INFO" | grep "key:" | sed 's/.*key":"\([^"]*\)".*/\1/' | tr -d '\r')
+
 log_info "ML Ops Address: $ML_OPS_ADDRESS"
+log_success "ML Ops key created"
 
-log_success "Keys created"
+# Save ML ops mnemonic to a file for backup
+log_warn "The ML Ops key mnemonic was displayed above. Save it for backup!"
 
 # ============================================================================
-# Step 7: Grant ML Ops Permissions
+# Step 7: Instructions for Granting ML Ops Permissions
 # ============================================================================
-log_step 7 "Granting ML Ops permissions..."
+log_step 7 "ML Ops permissions setup..."
 
-if [ -n "$ACCOUNT_ADDRESS" ] && [ -n "$ML_OPS_ADDRESS" ]; then
-    log_info "Submitting grant-ml-ops-permissions transaction..."
-    
-    echo "$KEYRING_PASSWORD" | inferenced tx inference grant-ml-ops-permissions \
-        gonka-account-key \
-        "$ML_OPS_ADDRESS" \
-        --from gonka-account-key \
-        --keyring-backend file \
-        --node http://node2.gonka.ai:26657 \
-        --chain-id gonka-mainnet \
-        --gas 1000000 \
-        -y 2>&1 | tail -5
-    
-    sleep 10
-    log_success "ML Ops permissions granted"
-else
-    log_warn "Skipping grant - keys not properly created"
+# Save the grant command for the user
+GRANT_CMD="inferenced tx inference grant-ml-ops-permissions \\
+    YOUR_ACCOUNT_KEY_NAME \\
+    $ML_OPS_ADDRESS \\
+    --from YOUR_ACCOUNT_KEY_NAME \\
+    --keyring-backend file \\
+    --node http://node2.gonka.ai:26657 \\
+    --chain-id gonka-mainnet \\
+    --gas 1000000 -y"
+
+echo "$GRANT_CMD" > /opt/gonka/grant_permissions.sh
+chmod +x /opt/gonka/grant_permissions.sh
+
+log_warn "IMPORTANT: Run this command on YOUR LOCAL MACHINE (where your account key is):"
+echo ""
+echo "  $GRANT_CMD"
+echo ""
+log_info "This grants the ML Ops key permission to operate on behalf of your account."
+log_info "Command saved to: /opt/gonka/grant_permissions.sh"
+
+# Ask if they want to wait or continue
+echo ""
+read -p "Have you run the grant command on your local machine? (y/n): " GRANT_DONE
+if [ "$GRANT_DONE" != "y" ] && [ "$GRANT_DONE" != "Y" ]; then
+    log_warn "Remember to run the grant command before the node can earn rewards!"
 fi
 
 # ============================================================================
@@ -380,22 +382,20 @@ sleep 90
 # ============================================================================
 log_step 10 "Registering node and downloading model..."
 
-# Register/update participant on network
-if [ -n "$ACCOUNT_ADDRESS" ]; then
-    log_info "Registering node on Gonka network..."
-    
-    echo "$KEYRING_PASSWORD" | inferenced tx inference submit-new-participant \
-        "http://${SERVER_IP}:8000" \
-        --keyring-backend file \
-        --from gonka-account-key \
-        --node http://node2.gonka.ai:26657 \
-        --chain-id gonka-mainnet \
-        --gas 1000000 \
-        -y 2>&1 | tail -3
-    
-    sleep 10
-    log_success "Node registered"
-fi
+# Save registration command for user
+REGISTER_CMD="inferenced tx inference submit-new-participant \\
+    http://${SERVER_IP}:8000 \\
+    --from YOUR_ACCOUNT_KEY_NAME \\
+    --keyring-backend file \\
+    --node http://node2.gonka.ai:26657 \\
+    --chain-id gonka-mainnet \\
+    --gas 1000000 -y"
+
+echo "$REGISTER_CMD" > /opt/gonka/register_node.sh
+chmod +x /opt/gonka/register_node.sh
+
+log_info "Node registration command saved to: /opt/gonka/register_node.sh"
+log_info "Run this on your local machine if this is a new node or you changed the IP."
 
 # Download model
 if [ "$SKIP_MODEL_DOWNLOAD" != "1" ]; then
@@ -449,10 +449,11 @@ log_info "Container Status:"
 docker ps --format 'table {{.Names}}\t{{.Status}}' | head -10
 
 echo ""
-log_info "Account Information:"
-echo "  Address:       $ACCOUNT_ADDRESS"
-echo "  ML Ops:        $ML_OPS_ADDRESS"
-echo "  Keyring Pass:  $KEYRING_PASSWORD"
+log_info "Key Information:"
+echo "  ML Ops Address:  $ML_OPS_ADDRESS"
+echo "  ML Ops Pubkey:   $ML_OPS_PUBKEY"
+echo "  Account Pubkey:  $ACCOUNT_PUBKEY"
+echo "  Keyring Pass:    $KEYRING_PASSWORD"
 
 echo ""
 log_info "Node Information:"
@@ -467,8 +468,15 @@ if [ "$HAS_GPU" = true ]; then
 fi
 
 echo ""
-log_info "Verify Registration:"
-echo "  curl -s 'http://node2.gonka.ai:8000/chain-api/productscience/inference/inference/participant/$ACCOUNT_ADDRESS' | jq"
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  ⚠️  IMPORTANT: Complete these steps on YOUR LOCAL MACHINE  ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+log_warn "1. Grant ML Ops permissions (REQUIRED for earning):"
+echo "   $GRANT_CMD"
+echo ""
+log_warn "2. Register node (if new or IP changed):"
+echo "   $REGISTER_CMD"
 
 echo ""
 log_info "Useful Commands:"
@@ -488,6 +496,11 @@ echo "  # Restart"
 echo "  cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart"
 echo ""
 
-log_warn "IMPORTANT: Save your keyring password: $KEYRING_PASSWORD"
 echo ""
-log_success "Your Gonka node is ready! PoC validation happens every 24h. Happy earning! 💰"
+log_warn "SAVE THIS INFORMATION:"
+echo "  - Keyring password: $KEYRING_PASSWORD"
+echo "  - ML Ops address: $ML_OPS_ADDRESS"
+echo "  - Grant command: /opt/gonka/grant_permissions.sh"
+echo "  - Register command: /opt/gonka/register_node.sh"
+echo ""
+log_success "Server setup complete! Run the grant command from your local machine to start earning! 💰"
