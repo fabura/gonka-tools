@@ -377,6 +377,10 @@ async def handle_update(update):
 /pow - PoW/PoC status
 /report - Send full report
 
+<b>Setup:</b>
+/install &lt;ip&gt; &lt;pubkey&gt; - Install node on new server
+/check &lt;ip&gt; - Check server before install
+
 <b>Auto:</b> Reports every 30 min""")
     
     elif cmd == "/status":
@@ -491,6 +495,181 @@ Epochs completed: {}
                 p["poc_current"],
                 "\n  ".join(models)
             ))
+    
+    elif text.lower().startswith("/check "):
+        # Check a server before installation
+        parts = text.strip().split()
+        if len(parts) < 2:
+            await send_message(chat_id, "Usage: /check <ip>")
+            return
+        
+        ip = parts[1]
+        await send_message(chat_id, "🔍 Checking server {}...".format(ip))
+        
+        config = {"host": ip, "port": 22, "user": "root", "key_path": "/root/.ssh/gonka_key"}
+        
+        # Check connectivity
+        ok, out = ssh_exec(ip, "echo ok", config)
+        if not ok:
+            await send_message(chat_id, "❌ Cannot connect: {}".format(out))
+            return
+        
+        # Get system info
+        ok, hostname = ssh_exec(ip, "hostname", config)
+        ok, cpu_info = ssh_exec(ip, "nproc", config)
+        ok, mem_info = ssh_exec(ip, "free -h | grep Mem | awk '{print $2}'", config)
+        ok, disk_info = ssh_exec(ip, "df -h / | tail -1 | awk '{print $4}'", config)
+        ok, gpu_info = ssh_exec(ip, "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'No GPU'", config)
+        ok, docker_info = ssh_exec(ip, "docker --version 2>/dev/null || echo 'Not installed'", config)
+        ok, gonka_info = ssh_exec(ip, "test -d /opt/gonka && echo 'Installed' || echo 'Not installed'", config)
+        
+        await send_message(chat_id, """✅ <b>Server Check: {}</b>
+
+<b>System:</b>
+  Hostname: {}
+  CPUs: {}
+  RAM: {}
+  Disk Free: {}
+
+<b>GPU:</b>
+  {}
+
+<b>Software:</b>
+  Docker: {}
+  Gonka: {}""".format(ip, hostname, cpu_info, mem_info, disk_info, gpu_info, docker_info, gonka_info))
+    
+    elif text.lower().startswith("/install "):
+        # Install Gonka on a new server
+        parts = text.strip().split()
+        if len(parts) < 3:
+            await send_message(chat_id, "Usage: /install <ip> <account_pubkey>\n\nExample:\n/install 65.108.33.117 AxIZzsbyk90lA...")
+            return
+        
+        ip = parts[1]
+        pubkey = parts[2]
+        
+        await send_message(chat_id, "🚀 Starting Gonka installation on {}...\nThis will take 10-15 minutes.".format(ip))
+        
+        config = {"host": ip, "port": 22, "user": "root", "key_path": "/root/.ssh/gonka_key"}
+        
+        # Check connectivity first
+        ok, _ = ssh_exec(ip, "echo ok", config)
+        if not ok:
+            await send_message(chat_id, "❌ Cannot connect to {}. Check SSH key.".format(ip))
+            return
+        
+        # Run installation
+        await send_message(chat_id, "📦 Step 1/5: Installing dependencies...")
+        ok, out = ssh_exec(ip, "apt-get update -qq && apt-get install -y -qq curl wget git jq unzip expect docker.io", config)
+        if not ok:
+            await send_message(chat_id, "❌ Failed to install dependencies")
+            return
+        
+        await send_message(chat_id, "🐳 Step 2/5: Setting up Docker & NVIDIA...")
+        ok, _ = ssh_exec(ip, """
+            systemctl enable docker && systemctl start docker
+            if lspci | grep -i nvidia > /dev/null; then
+                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
+                curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+                apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit
+                nvidia-ctk runtime configure --runtime=docker
+                systemctl restart docker
+            fi
+        """, config)
+        
+        await send_message(chat_id, "📥 Step 3/5: Cloning Gonka repository...")
+        ok, _ = ssh_exec(ip, """
+            rm -rf /opt/gonka
+            git clone https://github.com/gonka-ai/gonka.git -b main /opt/gonka --quiet
+            mkdir -p /mnt/shared
+            mkdir -p /root/.inference/keyring-file
+        """, config)
+        
+        await send_message(chat_id, "🔐 Step 4/5: Creating ML Ops key...")
+        # Create ML ops key
+        ok, key_output = ssh_exec(ip, """
+            cd /opt/gonka/deploy/join
+            expect << 'EOF'
+spawn inferenced keys add ml-ops-key --keyring-backend file
+expect "passphrase"
+send "gonkapass\\r"
+expect "passphrase"
+send "gonkapass\\r"
+expect eof
+EOF
+            sleep 2
+            echo "---KEY_INFO---"
+            echo "gonkapass" | inferenced keys show ml-ops-key --keyring-backend file 2>/dev/null
+        """, config)
+        
+        # Parse ML ops address
+        ml_ops_address = ""
+        if "---KEY_INFO---" in key_output:
+            for line in key_output.split("\n"):
+                if "address:" in line:
+                    ml_ops_address = line.split()[-1].strip()
+                    break
+        
+        await send_message(chat_id, "⚙️ Step 5/5: Configuring and starting services...")
+        # Create config and start
+        ok, _ = ssh_exec(ip, """
+            cd /opt/gonka/deploy/join
+            SERVER_IP=$(curl -s ifconfig.me)
+            
+            cat > .env << ENVEOF
+KEY_NAME=ml-ops-key
+KEYRING_PASSWORD=gonkapass
+KEYRING_BACKEND=file
+API_PORT=8000
+API_SSL_PORT=8443
+PUBLIC_URL=http://${{SERVER_IP}}:8000
+P2P_EXTERNAL_ADDRESS=tcp://${{SERVER_IP}}:5000
+ACCOUNT_PUBKEY={pubkey}
+NODE_CONFIG=./node-config.json
+HF_HOME=/mnt/shared
+SEED_API_URL=http://node2.gonka.ai:8000
+SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
+SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
+DAPI_API__POC_CALLBACK_URL=http://api:9100
+DAPI_CHAIN_NODE__URL=http://node:26657
+DAPI_CHAIN_NODE__P2P_URL=http://node:26656
+RPC_SERVER_URL_1=http://node1.gonka.ai:26657
+RPC_SERVER_URL_2=http://node2.gonka.ai:26657
+PORT=8080
+INFERENCE_PORT=5050
+ENVEOF
+            
+            mkdir -p .inference/keyring-file
+            cp -r /root/.inference/keyring-file/* .inference/keyring-file/ 2>/dev/null || true
+            
+            docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull 2>&1 | tail -3
+            docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d 2>&1 | tail -5
+        """.format(pubkey=pubkey), config)
+        
+        # Wait a bit and check status
+        await send_message(chat_id, "⏳ Waiting for services to start (60s)...")
+        await asyncio.sleep(60)
+        
+        ok, status = ssh_exec(ip, "docker ps --format '{{.Names}}: {{.Status}}' | head -8", config)
+        
+        await send_message(chat_id, """✅ <b>Installation Complete!</b>
+
+<b>Server:</b> {}
+<b>ML Ops Address:</b> <code>{}</code>
+<b>Keyring Password:</b> <code>gonkapass</code>
+
+<b>Containers:</b>
+<pre>{}</pre>
+
+⚠️ <b>IMPORTANT:</b> Run this on YOUR LOCAL machine:
+<pre>inferenced tx inference grant-ml-ops-permissions \\
+  YOUR_ACCOUNT_KEY \\
+  {} \\
+  --from YOUR_ACCOUNT_KEY \\
+  --keyring-backend file \\
+  --node http://node2.gonka.ai:26657 \\
+  --chain-id gonka-mainnet \\
+  --gas 1000000 -y</pre>""".format(ip, ml_ops_address, status, ml_ops_address))
     
     elif cmd == "/report":
         await send_report()
