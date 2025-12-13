@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gonka.ai Interactive Telegram Bot with Full Node Status
+Gonka.ai Telegram Bot v3 - Complete Node Monitoring
 """
 
 import asyncio
@@ -25,6 +25,8 @@ NODES = {
     }
 }
 
+PUBLIC_API = "http://node2.gonka.ai:8000"
+
 CHECK_INTERVAL = 300
 REPORT_INTERVAL = 1800
 ALERT_COOLDOWN = 600
@@ -42,7 +44,7 @@ def ssh_exec(host, cmd, config):
             port=config["port"],
             username=config["user"],
             key_filename=config["key_path"],
-            timeout=10,
+            timeout=15,
         )
         _, stdout, stderr = client.exec_command(cmd, timeout=30)
         output = stdout.read().decode().strip()
@@ -50,6 +52,26 @@ def ssh_exec(host, cmd, config):
         return True, output
     except Exception as e:
         return False, str(e)
+
+
+async def fetch_url(url, timeout=10):
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=timeout)
+            return resp.json()
+    except:
+        return None
+
+
+async def get_network_participant():
+    """Get participant info from Gonka network"""
+    url = "{}/chain-api/productscience/inference/inference/participant/{}".format(
+        PUBLIC_API, WALLET_ADDRESS
+    )
+    data = await fetch_url(url)
+    if data and "participant" in data:
+        return data["participant"]
+    return None
 
 
 async def send_message(chat_id, text):
@@ -64,24 +86,18 @@ async def send_message(chat_id, text):
         print("Send error: {}".format(e))
 
 
-def get_full_node_status(name, config):
-    """Get comprehensive node status including Gonka-specific checks"""
+def get_full_status(name, config):
+    """Get comprehensive node status"""
     status = {
         "name": name,
-        "host": config["host"],
         "reachable": False,
-        # System
         "cpu": 0, "memory": 0, "disk": 0, "uptime": "",
-        # GPU
-        "gpu_names": [], "gpu_temps": [], "gpu_util": [], "gpu_mem_used": [], "gpu_mem_total": [],
-        # Docker
-        "containers": 0, "containers_healthy": 0, "containers_unhealthy": [],
-        # Gonka specific
-        "sync_catching_up": None, "sync_block": "0",
-        "service_state": "UNKNOWN", "pow_status": "UNKNOWN",
+        "gpu_names": [], "gpu_temps": [], "gpu_util": [], "gpu_mem": [],
+        "containers": 0, "containers_healthy": 0, "unhealthy": [],
+        "sync_block": "0", "synced": False,
+        "service_state": "UNKNOWN",
         "inference_running": False, "pow_running": False,
-        "models": [], "models_downloading": [],
-        "balance": None,
+        "models": [],
     }
     
     ok, _ = ssh_exec(name, "echo ok", config)
@@ -89,7 +105,7 @@ def get_full_node_status(name, config):
         return status
     status["reachable"] = True
     
-    # System metrics
+    # System
     ok, out = ssh_exec(name, "top -bn1 | grep 'Cpu(s)' | awk '{print \}'", config)
     if ok and out:
         try: status["cpu"] = float(out.replace("%", ""))
@@ -108,63 +124,49 @@ def get_full_node_status(name, config):
     ok, out = ssh_exec(name, "uptime -p", config)
     if ok: status["uptime"] = out
     
-    # GPU metrics
+    # GPU
     ok, out = ssh_exec(name, "nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null", config)
     if ok and out:
         for line in out.split("\n"):
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 5:
-                status["gpu_names"].append(parts[0])
+                status["gpu_names"].append(parts[0].replace("NVIDIA ", ""))
                 try:
                     status["gpu_temps"].append(float(parts[1]))
                     status["gpu_util"].append(float(parts[2]))
-                    status["gpu_mem_used"].append(float(parts[3]))
-                    status["gpu_mem_total"].append(float(parts[4]))
+                    status["gpu_mem"].append("{}/{}".format(int(float(parts[3])/1024), int(float(parts[4])/1024)))
                 except: pass
     
-    # Docker containers
+    # Docker
     ok, out = ssh_exec(name, "docker ps --format '{{.Names}}:{{.Status}}' 2>/dev/null", config)
     if ok and out:
         for line in out.split("\n"):
             if line:
                 status["containers"] += 1
-                if "healthy" in line.lower() or "up" in line.lower():
-                    if "unhealthy" not in line.lower() and "restarting" not in line.lower():
-                        status["containers_healthy"] += 1
-                    else:
-                        name_part = line.split(":")[0]
-                        status["containers_unhealthy"].append(name_part)
+                name_part = line.split(":")[0]
+                if "unhealthy" in line.lower() or "restarting" in line.lower():
+                    status["unhealthy"].append(name_part)
                 else:
-                    name_part = line.split(":")[0]
-                    status["containers_unhealthy"].append(name_part)
+                    status["containers_healthy"] += 1
     
-    # Node sync status
+    # Sync
     ok, out = ssh_exec(name, "curl -s http://localhost:26657/status 2>/dev/null", config)
     if ok and out:
         try:
             data = json.loads(out)
             sync = data.get("result", {}).get("sync_info", {})
-            status["sync_catching_up"] = sync.get("catching_up", True)
+            status["synced"] = not sync.get("catching_up", True)
             status["sync_block"] = sync.get("latest_block_height", "0")
         except: pass
     
-    # MLNode health
+    # MLNode
     ok, out = ssh_exec(name, "curl -s http://localhost:8080/health 2>/dev/null", config)
     if ok and out:
         try:
             data = json.loads(out)
             status["service_state"] = data.get("service_state", "UNKNOWN")
-            managers = data.get("managers", {})
-            status["pow_running"] = managers.get("pow", {}).get("running", False)
-            status["inference_running"] = managers.get("inference", {}).get("running", False)
-        except: pass
-    
-    # PoW status
-    ok, out = ssh_exec(name, "curl -s http://localhost:8080/api/v1/pow/status 2>/dev/null", config)
-    if ok and out:
-        try:
-            data = json.loads(out)
-            status["pow_status"] = data.get("status", "UNKNOWN")
+            status["inference_running"] = data.get("managers", {}).get("inference", {}).get("running", False)
+            status["pow_running"] = data.get("managers", {}).get("pow", {}).get("running", False)
         except: pass
     
     # Models
@@ -173,136 +175,127 @@ def get_full_node_status(name, config):
         try:
             data = json.loads(out)
             for m in data.get("models", []):
-                model_name = m.get("model", {}).get("hf_repo", "unknown")
-                model_status = m.get("status", "UNKNOWN")
-                if model_status == "DOWNLOADED":
-                    status["models"].append(model_name)
-                elif model_status == "DOWNLOADING":
-                    status["models_downloading"].append(model_name)
+                if m.get("status") == "DOWNLOADED":
+                    status["models"].append(m.get("model", {}).get("hf_repo", "unknown"))
         except: pass
-    
-    # Balance (via docker network)
-    ok, out = ssh_exec(name, "NODE_IP=\ && curl -s http://\:1317/cosmos/bank/v1beta1/balances/{} 2>/dev/null".format(WALLET_ADDRESS), config)
-    if ok and out:
-        try:
-            data = json.loads(out)
-            for b in data.get("balances", []):
-                if b.get("denom") in ["ugnk", "gnk"]:
-                    amount = float(b.get("amount", 0))
-                    if b.get("denom") == "ugnk":
-                        amount = amount / 1000000
-                    status["balance"] = amount
-        except: pass
-    if status["balance"] is None:
-        status["balance"] = 0.0
     
     return status
 
 
-def format_full_status(s):
+async def get_earnings_info():
+    """Get earnings and epoch info from network"""
+    info = {
+        "status": "UNKNOWN",
+        "url": "",
+        "epochs_completed": 0,
+        "epoch_inferences": 0,
+        "epoch_earned": 0,
+        "balance": 0,
+    }
+    
+    participant = await get_network_participant()
+    if participant:
+        info["status"] = participant.get("status", "UNKNOWN")
+        info["url"] = participant.get("inference_url", "")
+        info["epochs_completed"] = participant.get("epochs_completed", 0)
+        stats = participant.get("current_epoch_stats", {})
+        info["epoch_inferences"] = int(stats.get("inference_count", 0))
+        info["epoch_earned"] = int(stats.get("earned_coins", 0))
+        info["balance"] = int(participant.get("coin_balance", 0))
+    
+    return info
+
+
+def format_status_message(s, earnings):
     """Format comprehensive status message"""
     if not s["reachable"]:
-        return "❌ <b>{}</b> - UNREACHABLE".format(s["name"])
+        return "❌ <b>{}</b> - OFFLINE".format(s["name"])
     
-    # Status icons
-    sync_icon = "✅" if s["sync_catching_up"] == False else "🔄" if s["sync_catching_up"] else "❓"
-    service_icon = "🟢" if s["service_state"] in ["POW", "INFERENCE"] else "🟡" if s["service_state"] == "STOPPED" else "🔴"
-    pow_icon = "✅" if s["pow_running"] else "⏸"
+    # Icons
+    sync_icon = "✅" if s["synced"] else "🔄"
+    state_icon = "🟢" if s["service_state"] == "INFERENCE" else "🟡" if s["service_state"] == "STOPPED" else "🔵"
     inf_icon = "✅" if s["inference_running"] else "⏸"
     
     # GPU info
     gpu_lines = []
     for i in range(len(s["gpu_names"])):
-        name = s["gpu_names"][i].replace("NVIDIA ", "")
         temp = int(s["gpu_temps"][i]) if i < len(s["gpu_temps"]) else 0
         util = int(s["gpu_util"][i]) if i < len(s["gpu_util"]) else 0
-        mem_used = int(s["gpu_mem_used"][i]/1024) if i < len(s["gpu_mem_used"]) else 0
-        mem_total = int(s["gpu_mem_total"][i]/1024) if i < len(s["gpu_mem_total"]) else 0
-        gpu_lines.append("  GPU{}: {}°C {}% {}/{}GB".format(i, temp, util, mem_used, mem_total))
+        mem = s["gpu_mem"][i] if i < len(s["gpu_mem"]) else "0/0"
+        gpu_lines.append("  {} {}°C {}% {}GB".format(s["gpu_names"][i], temp, util, mem))
     gpu_text = "\n".join(gpu_lines) if gpu_lines else "  No GPUs"
     
     # Models
     models_text = ", ".join(s["models"]) if s["models"] else "None"
-    if s["models_downloading"]:
-        models_text += " (⏳ downloading: {})".format(", ".join(s["models_downloading"]))
     
-    # Unhealthy containers
+    # Unhealthy
     unhealthy_text = ""
-    if s["containers_unhealthy"]:
-        unhealthy_text = "\n⚠️ Unhealthy: {}".format(", ".join(s["containers_unhealthy"]))
+    if s["unhealthy"]:
+        unhealthy_text = "\n⚠️ Issues: {}".format(", ".join(s["unhealthy"]))
+    
+    # Earnings
+    balance_gnk = earnings["balance"] / 1000000000 if earnings["balance"] > 0 else 0
+    epoch_earned_gnk = earnings["epoch_earned"] / 1000000000 if earnings["epoch_earned"] > 0 else 0
     
     return """<b>{name}</b>
 
 <b>📊 System</b>
   CPU: {cpu:.0f}% | RAM: {mem:.0f}% | Disk: {disk:.0f}%
-  Uptime: {uptime}
+  {uptime}
 
 <b>🖥 GPUs</b>
 {gpu}
 
 <b>⛓ Blockchain</b>
-  {sync_icon} Sync: Block {block} {sync_status}
+  {sync_icon} Block {block} ({sync_status})
 
-<b>🤖 Gonka Services</b>
-  {service_icon} State: {state}
-  {pow_icon} PoW: {pow_status}
+<b>🤖 Gonka</b>
+  {state_icon} State: {state}
   {inf_icon} Inference: {inf_status}
+  📦 Models: {models}
 
-<b>📦 Models</b>
-  {models}
+<b>🌐 Network</b>
+  Status: {net_status}
+  Epochs: {epochs}
+  
+<b>💰 Earnings</b>
+  Balance: {balance:.4f} GNK
+  This epoch: {epoch_earned:.6f} GNK ({epoch_inf} inferences)
 
 <b>🐳 Containers</b>
-  {containers_ok}/{containers_total} healthy{unhealthy}
-
-<b>💰 Balance</b>
-  {balance:.4f} GNK""".format(
+  {containers_ok}/{containers_total} healthy{unhealthy}""".format(
         name=s["name"],
         cpu=s["cpu"], mem=s["memory"], disk=s["disk"],
         uptime=s["uptime"],
         gpu=gpu_text,
         sync_icon=sync_icon,
         block=s["sync_block"],
-        sync_status="(syncing)" if s["sync_catching_up"] else "(synced)",
-        service_icon=service_icon,
+        sync_status="synced" if s["synced"] else "syncing",
+        state_icon=state_icon,
         state=s["service_state"],
-        pow_icon=pow_icon,
-        pow_status=s["pow_status"],
         inf_icon=inf_icon,
         inf_status="Running" if s["inference_running"] else "Stopped",
         models=models_text,
+        net_status=earnings["status"],
+        epochs=earnings["epochs_completed"],
+        balance=balance_gnk,
+        epoch_earned=epoch_earned_gnk,
+        epoch_inf=earnings["epoch_inferences"],
         containers_ok=s["containers_healthy"],
         containers_total=s["containers"],
-        unhealthy=unhealthy_text,
-        balance=s["balance"]
+        unhealthy=unhealthy_text
     )
 
 
-async def send_periodic_report():
-    report_lines = ["📊 <b>Status Report</b> - {}".format(datetime.now().strftime("%H:%M")), ""]
+async def send_report():
+    """Send periodic status report"""
+    earnings = await get_earnings_info()
     
     for name, config in NODES.items():
-        s = get_full_node_status(name, config)
-        
-        if not s["reachable"]:
-            report_lines.append("❌ {} - OFFLINE".format(name))
-            continue
-        
-        sync_icon = "✅" if s["sync_catching_up"] == False else "🔄"
-        service_icon = "🟢" if s["service_state"] in ["POW", "INFERENCE"] else "🟡"
-        
-        gpu_info = ""
-        if s["gpu_temps"]:
-            temps = ["{}°C".format(int(t)) for t in s["gpu_temps"]]
-            utils = ["{}%".format(int(u)) for u in s["gpu_util"]]
-            gpu_info = " | GPU: {} {}".format("/".join(temps), "/".join(utils))
-        
-        report_lines.append("{} <b>{}</b>".format(service_icon, name))
-        report_lines.append("  CPU:{:.0f}% RAM:{:.0f}%{}".format(s["cpu"], s["memory"], gpu_info))
-        report_lines.append("  {} Block {} | PoW: {}".format(sync_icon, s["sync_block"], s["pow_status"]))
-        report_lines.append("  💰 {:.4f} GNK".format(s["balance"]))
-        report_lines.append("")
-    
-    await send_message(ALLOWED_CHAT_ID, "\n".join(report_lines))
+        status = get_full_status(name, config)
+        msg = format_status_message(status, earnings)
+        msg += "\n\n📅 {}".format(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        await send_message(ALLOWED_CHAT_ID, msg)
 
 
 async def handle_update(update):
@@ -320,13 +313,13 @@ async def handle_update(update):
     cmd = text.lower().strip()
     
     if cmd == "/start" or cmd == "/help":
-        await send_message(chat_id, """🤖 <b>Gonka.ai Bot v2</b>
+        await send_message(chat_id, """🤖 <b>Gonka Bot v3</b>
 
 <b>Commands:</b>
 /status - Full node status
-/quick - Quick status summary
+/quick - Quick summary
+/earnings - Balance & epoch stats  
 /sync - Blockchain sync
-/balance - Wallet balance
 /models - Downloaded models
 /logs - Recent logs
 /restart - Restart services
@@ -335,87 +328,115 @@ async def handle_update(update):
 <b>Auto:</b> Reports every 30 min""")
     
     elif cmd == "/status":
-        await send_message(chat_id, "🔍 Getting full status...")
+        await send_message(chat_id, "🔍 Getting status...")
+        earnings = await get_earnings_info()
         for name, config in NODES.items():
-            status = get_full_node_status(name, config)
-            await send_message(chat_id, format_full_status(status))
+            status = get_full_status(name, config)
+            await send_message(chat_id, format_status_message(status, earnings))
     
     elif cmd == "/quick":
+        earnings = await get_earnings_info()
         for name, config in NODES.items():
-            s = get_full_node_status(name, config)
+            s = get_full_status(name, config)
             if not s["reachable"]:
                 await send_message(chat_id, "❌ {} offline".format(name))
             else:
-                sync = "✅" if not s["sync_catching_up"] else "🔄"
-                svc = "🟢" if s["service_state"] in ["POW","INFERENCE"] else "🟡"
-                await send_message(chat_id, "{} {} | {} Block {} | 💰{:.2f}".format(
-                    svc, name, sync, s["sync_block"], s["balance"]))
+                sync = "✅" if s["synced"] else "🔄"
+                state = "🟢" if s["service_state"] == "INFERENCE" else "🟡"
+                balance = earnings["balance"] / 1000000000
+                await send_message(chat_id, "{} {} | {} Blk {} | 💰{:.4f} GNK".format(
+                    state, name[:15], sync, s["sync_block"], balance))
+    
+    elif cmd == "/earnings" or cmd == "/balance":
+        earnings = await get_earnings_info()
+        balance = earnings["balance"] / 1000000000
+        epoch_earned = earnings["epoch_earned"] / 1000000000
+        await send_message(chat_id, """💰 <b>Earnings</b>
+
+Balance: <b>{:.4f} GNK</b>
+Status: {}
+Epochs completed: {}
+
+<b>Current Epoch:</b>
+  Inferences: {}
+  Earned: {:.6f} GNK""".format(
+            balance, earnings["status"], earnings["epochs_completed"],
+            earnings["epoch_inferences"], epoch_earned))
     
     elif cmd == "/sync":
-        config = list(NODES.values())[0]
-        s = get_full_node_status(list(NODES.keys())[0], config)
-        icon = "✅" if s["sync_catching_up"] == False else "🔄"
-        await send_message(chat_id, "{} Block: {}\nSyncing: {}".format(
-            icon, s["sync_block"], "Yes" if s["sync_catching_up"] else "No"))
-    
-    elif cmd == "/balance":
-        config = list(NODES.values())[0]
-        s = get_full_node_status(list(NODES.keys())[0], config)
-        await send_message(chat_id, "💰 Balance: {:.4f} GNK".format(s["balance"]))
+        for name, config in NODES.items():
+            s = get_full_status(name, config)
+            icon = "✅" if s["synced"] else "🔄"
+            await send_message(chat_id, "{} Block: {}\nSynced: {}".format(
+                icon, s["sync_block"], "Yes" if s["synced"] else "No"))
     
     elif cmd == "/models":
-        config = list(NODES.values())[0]
-        s = get_full_node_status(list(NODES.keys())[0], config)
-        text = "📦 <b>Models</b>\n\n"
-        if s["models"]:
-            for m in s["models"]:
-                text += "✅ {}\n".format(m)
-        else:
-            text += "No models downloaded\n"
-        if s["models_downloading"]:
-            text += "\n⏳ Downloading:\n"
-            for m in s["models_downloading"]:
-                text += "  {}\n".format(m)
-        await send_message(chat_id, text)
+        for name, config in NODES.items():
+            s = get_full_status(name, config)
+            if s["models"]:
+                text = "📦 <b>Models</b>\n\n" + "\n".join(["✅ {}".format(m) for m in s["models"]])
+            else:
+                text = "📦 No models downloaded"
+            await send_message(chat_id, text)
     
     elif cmd == "/logs":
-        node_name = list(NODES.keys())[0]
-        ok, logs = ssh_exec(node_name,
-            "cd /opt/gonka/deploy/join && docker compose logs --tail 20 2>&1 | tail -30",
-            NODES[node_name])
+        name = list(NODES.keys())[0]
+        config = NODES[name]
+        ok, logs = ssh_exec(name,
+            "cd /opt/gonka/deploy/join && docker compose logs --tail 15 2>&1 | tail -25",
+            config)
         if ok and logs:
             await send_message(chat_id, "<pre>{}</pre>".format(logs[-3500:]))
         else:
-            await send_message(chat_id, "❌ Failed")
+            await send_message(chat_id, "❌ Failed to get logs")
     
     elif cmd == "/restart":
-        node_name = list(NODES.keys())[0]
+        name = list(NODES.keys())[0]
+        config = NODES[name]
         await send_message(chat_id, "🔄 Restarting...")
-        ok, _ = ssh_exec(node_name,
-            "cd /opt/gonka/deploy/join && source config.env && docker compose restart 2>&1",
-            NODES[node_name])
-        await send_message(chat_id, "✅ Done!" if ok else "❌ Failed")
+        ok, _ = ssh_exec(name,
+            "cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart 2>&1",
+            config)
+        await send_message(chat_id, "✅ Restart initiated" if ok else "❌ Failed")
     
     elif cmd == "/report":
-        await send_periodic_report()
+        await send_report()
 
 
 async def check_alerts():
     global _last_alerts
+    now = time.time()
+    
     for name, config in NODES.items():
-        s = get_full_node_status(name, config)
-        now = time.time()
+        s = get_full_status(name, config)
         
+        # Offline alert
         if not s["reachable"]:
-            key = name + ":unreachable"
+            key = "{}:offline".format(name)
             if key not in _last_alerts or now - _last_alerts[key] > ALERT_COOLDOWN:
-                await send_message(ALLOWED_CHAT_ID, "🚨 {} unreachable!".format(name))
+                await send_message(ALLOWED_CHAT_ID, "🚨 <b>{}</b> is OFFLINE!".format(name))
                 _last_alerts[key] = now
-        elif s["containers_healthy"] < s["containers"] - 1:
-            key = name + ":unhealthy"
+            continue
+        
+        # Not synced
+        if not s["synced"]:
+            key = "{}:sync".format(name)
+            if key not in _last_alerts or now - _last_alerts[key] > ALERT_COOLDOWN * 2:
+                await send_message(ALLOWED_CHAT_ID, "⚠️ <b>{}</b> not synced (block {})".format(name, s["sync_block"]))
+                _last_alerts[key] = now
+        
+        # Inference not running when it should be
+        if s["service_state"] == "INFERENCE" and not s["inference_running"]:
+            key = "{}:inference".format(name)
             if key not in _last_alerts or now - _last_alerts[key] > ALERT_COOLDOWN:
-                await send_message(ALLOWED_CHAT_ID, "⚠️ {} has unhealthy containers: {}".format(
-                    name, ", ".join(s["containers_unhealthy"])))
+                await send_message(ALLOWED_CHAT_ID, "⚠️ <b>{}</b> inference stopped!".format(name))
+                _last_alerts[key] = now
+        
+        # Container issues
+        if len(s["unhealthy"]) > 1:  # Allow 1 unhealthy (bridge)
+            key = "{}:containers".format(name)
+            if key not in _last_alerts or now - _last_alerts[key] > ALERT_COOLDOWN:
+                await send_message(ALLOWED_CHAT_ID, "⚠️ <b>{}</b> unhealthy: {}".format(name, ", ".join(s["unhealthy"])))
                 _last_alerts[key] = now
 
 
@@ -439,34 +460,42 @@ async def poll_updates():
 
 async def periodic_tasks():
     global _last_report
+    _last_report = time.time()
+    
     while True:
         await asyncio.sleep(60)
         now = time.time()
-        if now - _last_report >= REPORT_INTERVAL:
-            try:
-                await send_periodic_report()
-                _last_report = now
-            except: pass
+        
+        # Check alerts every 5 min
         try:
             await check_alerts()
-        except: pass
+        except Exception as e:
+            print("Alert error: {}".format(e))
+        
+        # Send report every 30 min
+        if now - _last_report >= REPORT_INTERVAL:
+            try:
+                await send_report()
+                _last_report = now
+            except Exception as e:
+                print("Report error: {}".format(e))
 
 
 async def main():
-    global _last_report
-    _last_report = time.time()
-    print("Gonka Bot v2 started")
-    await send_message(ALLOWED_CHAT_ID, """🤖 <b>Gonka Bot v2 Online!</b>
+    print("Gonka Bot v3 started at {}".format(datetime.now()))
+    
+    await send_message(ALLOWED_CHAT_ID, """🤖 <b>Gonka Bot v3 Online!</b>
 
-New /status shows:
-• Sync & block height
-• Service state & PoW status
-• Models downloaded
-• Container health
-• Balance
+<b>New features:</b>
+• Epoch & earnings tracking
+• Network registration status
+• Inference state monitoring
+• Smart alerts
 
-Type /help for commands""")
+Type /status for full report""")
+    
     await asyncio.gather(poll_updates(), periodic_tasks())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
