@@ -647,21 +647,45 @@ ENVEOF
         """.format(pubkey=pubkey), config)
         
         # Wait a bit and check status
-        await send_message(chat_id, "⏳ Waiting for services to start (60s)...")
-        await asyncio.sleep(60)
+        await send_message(chat_id, "⏳ Waiting for services to start (90s)...")
+        await asyncio.sleep(90)
+        
+        # Download model
+        await send_message(chat_id, "📥 Downloading model (Qwen/Qwen2.5-7B-Instruct)...")
+        ok, _ = ssh_exec(ip, """
+            curl -s -X POST http://localhost:8080/api/v1/models/download \
+                -H 'Content-Type: application/json' \
+                -d '{"hf_repo": "Qwen/Qwen2.5-7B-Instruct"}' > /dev/null 2>&1
+        """, config)
+        
+        # Check model status after a bit
+        await asyncio.sleep(30)
+        ok, model_status = ssh_exec(ip, """
+            curl -s -X POST http://localhost:8080/api/v1/models/status \
+                -H 'Content-Type: application/json' \
+                -d '{"hf_repo": "Qwen/Qwen2.5-7B-Instruct"}' 2>/dev/null | jq -r '.status' 2>/dev/null || echo 'UNKNOWN'
+        """, config)
         
         ok, status = ssh_exec(ip, "docker ps --format '{{.Names}}: {{.Status}}' | head -8", config)
         
+        # Get server's public IP
+        ok, server_ip = ssh_exec(ip, "curl -s ifconfig.me", config)
+        
+        model_msg = "✅ Downloaded" if "DOWNLOADED" in model_status else "⏳ Downloading (~15GB, check /models later)"
+        
         await send_message(chat_id, """✅ <b>Installation Complete!</b>
 
-<b>Server:</b> {}
+<b>Server:</b> {} ({})
 <b>ML Ops Address:</b> <code>{}</code>
 <b>Keyring Password:</b> <code>gonkapass</code>
+<b>Model:</b> Qwen/Qwen2.5-7B-Instruct - {}
 
 <b>Containers:</b>
 <pre>{}</pre>
 
-⚠️ <b>IMPORTANT:</b> Run this on YOUR LOCAL machine:
+⚠️ <b>Run these commands on YOUR LOCAL machine:</b>
+
+<b>1. Grant ML Ops permissions:</b>
 <pre>inferenced tx inference grant-ml-ops-permissions \\
   YOUR_ACCOUNT_KEY \\
   {} \\
@@ -669,7 +693,16 @@ ENVEOF
   --keyring-backend file \\
   --node http://node2.gonka.ai:26657 \\
   --chain-id gonka-mainnet \\
-  --gas 1000000 -y</pre>""".format(ip, ml_ops_address, status, ml_ops_address))
+  --gas 1000000 -y</pre>
+
+<b>2. Register node on network:</b>
+<pre>inferenced tx inference submit-new-participant \\
+  http://{}:8000 \\
+  --from YOUR_ACCOUNT_KEY \\
+  --keyring-backend file \\
+  --node http://node2.gonka.ai:26657 \\
+  --chain-id gonka-mainnet \\
+  --gas 1000000 -y</pre>""".format(ip, server_ip, ml_ops_address, model_msg, status, ml_ops_address, server_ip))
     
     elif cmd == "/report":
         await send_report()
