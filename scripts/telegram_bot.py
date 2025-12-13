@@ -5,6 +5,7 @@ Gonka.ai Telegram Bot v3 - Complete Node Monitoring
 
 import asyncio
 import json
+import subprocess
 import time
 from datetime import datetime
 
@@ -671,38 +672,62 @@ ENVEOF
         # Get server's public IP
         ok, server_ip = ssh_exec(ip, "curl -s ifconfig.me", config)
         
-        model_msg = "✅ Downloaded" if "DOWNLOADED" in model_status else "⏳ Downloading (~15GB, check /models later)"
+        model_msg = "✅ Downloaded" if "DOWNLOADED" in model_status else "⏳ Downloading (~15GB)"
+        
+        # Run grant-ml-ops-permissions from monitoring server
+        await send_message(chat_id, "🔐 Granting ML Ops permissions...")
+        try:
+            grant_result = subprocess.run([
+                "bash", "-c",
+                "echo 'gonkapass' | inferenced tx inference grant-ml-ops-permissions "
+                "gonka-account-key {} "
+                "--from gonka-account-key "
+                "--keyring-backend file "
+                "--node http://node2.gonka.ai:26657 "
+                "--chain-id gonka-mainnet "
+                "--gas 1000000 -y 2>&1".format(ml_ops_address)
+            ], capture_output=True, text=True, timeout=60)
+            grant_ok = "confirmed" in grant_result.stdout.lower() or grant_result.returncode == 0
+            grant_msg = "✅ Granted" if grant_ok else "⚠️ Check manually"
+        except Exception as e:
+            grant_msg = "⚠️ Error: {}".format(str(e)[:50])
+        
+        await asyncio.sleep(10)
+        
+        # Run submit-new-participant from monitoring server
+        await send_message(chat_id, "📝 Registering node on network...")
+        try:
+            register_result = subprocess.run([
+                "bash", "-c",
+                "echo 'gonkapass' | inferenced tx inference submit-new-participant "
+                "http://{}:8000 "
+                "--from gonka-account-key "
+                "--keyring-backend file "
+                "--node http://node2.gonka.ai:26657 "
+                "--chain-id gonka-mainnet "
+                "--gas 1000000 -y 2>&1".format(server_ip)
+            ], capture_output=True, text=True, timeout=60)
+            register_ok = "confirmed" in register_result.stdout.lower() or register_result.returncode == 0
+            register_msg = "✅ Registered" if register_ok else "⚠️ Check manually"
+        except Exception as e:
+            register_msg = "⚠️ Error: {}".format(str(e)[:50])
         
         await send_message(chat_id, """✅ <b>Installation Complete!</b>
 
 <b>Server:</b> {} ({})
 <b>ML Ops Address:</b> <code>{}</code>
 <b>Keyring Password:</b> <code>gonkapass</code>
-<b>Model:</b> Qwen/Qwen2.5-7B-Instruct - {}
+
+<b>Status:</b>
+  Model: {}
+  Grant: {}
+  Register: {}
 
 <b>Containers:</b>
 <pre>{}</pre>
 
-⚠️ <b>Run these commands on YOUR LOCAL machine:</b>
-
-<b>1. Grant ML Ops permissions:</b>
-<pre>inferenced tx inference grant-ml-ops-permissions \\
-  YOUR_ACCOUNT_KEY \\
-  {} \\
-  --from YOUR_ACCOUNT_KEY \\
-  --keyring-backend file \\
-  --node http://node2.gonka.ai:26657 \\
-  --chain-id gonka-mainnet \\
-  --gas 1000000 -y</pre>
-
-<b>2. Register node on network:</b>
-<pre>inferenced tx inference submit-new-participant \\
-  http://{}:8000 \\
-  --from YOUR_ACCOUNT_KEY \\
-  --keyring-backend file \\
-  --node http://node2.gonka.ai:26657 \\
-  --chain-id gonka-mainnet \\
-  --gas 1000000 -y</pre>""".format(ip, server_ip, ml_ops_address, model_msg, status, ml_ops_address, server_ip))
+🎉 Node is ready! PoC validation runs every 24h.""".format(
+            ip, server_ip, ml_ops_address, model_msg, grant_msg, register_msg, status))
     
     elif cmd == "/report":
         await send_report()
