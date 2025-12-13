@@ -712,22 +712,93 @@ ENVEOF
         except Exception as e:
             register_msg = "⚠️ Error: {}".format(str(e)[:50])
         
+        # Final status check - wait for everything to stabilize
+        await send_message(chat_id, "🔍 Running final status check...")
+        await asyncio.sleep(30)
+        
+        # Check sync status
+        ok, sync_out = ssh_exec(ip, "curl -s http://localhost:26657/status 2>/dev/null | jq -r '.result.sync_info | \"Block: \" + .latest_block_height + \" Syncing: \" + (.catching_up|tostring)'", config)
+        sync_msg = sync_out if ok and sync_out else "Checking..."
+        
+        # Check MLNode/PoW status
+        ok, health_out = ssh_exec(ip, """
+            curl -s http://localhost:8080/health 2>/dev/null | jq -r '"State: " + .service_state + " | Inference: " + (.managers.inference.running|tostring)'
+        """, config)
+        mlnode_msg = health_out if ok and health_out else "Starting..."
+        
+        # Check PoW status
+        ok, pow_out = ssh_exec(ip, "curl -s http://localhost:8080/api/v1/pow/status 2>/dev/null | jq -r '.status'", config)
+        pow_msg = pow_out if ok and pow_out else "UNKNOWN"
+        
+        # Check admin node status
+        ok, admin_out = ssh_exec(ip, """
+            curl -s http://localhost:9200/admin/v1/nodes 2>/dev/null | jq -r '.[0].state | "Intended: " + .intended_status + " | Current: " + .current_status'
+        """, config)
+        admin_msg = admin_out if ok and admin_out else "Initializing..."
+        
+        # Check participant registration on network
+        ok, participant_out = ssh_exec(ip, """
+            curl -s 'http://node2.gonka.ai:8000/chain-api/productscience/inference/inference/participant/gonka1k82cpjqhfgt347x7grdudu7zfaew6strzjwhyl' 2>/dev/null | jq -r '"Status: " + .participant.status + " | URL: " + .participant.inference_url'
+        """, config)
+        participant_msg = participant_out if ok and "http" in str(participant_out) else "Pending..."
+        
+        # Recheck model status
+        ok, model_final = ssh_exec(ip, """
+            curl -s http://localhost:8080/api/v1/models/list 2>/dev/null | jq -r '.models[0] | .model.hf_repo + ": " + .status'
+        """, config)
+        model_final_msg = model_final if ok and model_final else model_msg
+        
         await send_message(chat_id, """✅ <b>Installation Complete!</b>
 
-<b>Server:</b> {} ({})
-<b>ML Ops Address:</b> <code>{}</code>
-<b>Keyring Password:</b> <code>gonkapass</code>
+<b>Server:</b> {}
+<b>ML Ops:</b> <code>{}</code>
+<b>Password:</b> <code>gonkapass</code>
 
-<b>Status:</b>
-  Model: {}
+<b>📋 Setup Status:</b>
   Grant: {}
   Register: {}
 
-<b>Containers:</b>
+<b>⛓ Blockchain:</b>
+  {}
+
+<b>🤖 MLNode:</b>
+  {}
+  PoW: {}
+
+<b>🎮 Controller:</b>
+  {}
+
+<b>🌐 Network:</b>
+  {}
+
+<b>📦 Model:</b>
+  {}
+
+<b>🐳 Containers:</b>
 <pre>{}</pre>
 
-🎉 Node is ready! PoC validation runs every 24h.""".format(
-            ip, server_ip, ml_ops_address, model_msg, grant_msg, register_msg, status))
+{}""".format(
+            server_ip, ml_ops_address,
+            grant_msg, register_msg,
+            sync_msg,
+            mlnode_msg, pow_msg,
+            admin_msg,
+            participant_msg,
+            model_final_msg,
+            status,
+            "🎉 Ready! PoC runs every 24h." if "INFERENCE" in str(mlnode_msg) else "⏳ Starting up... Check /status in a few minutes."
+        ))
+        
+        # Add to NODES for monitoring
+        await send_message(chat_id, """📌 <b>Add to monitoring:</b>
+To add this node to bot monitoring, update NODES in bot.py:
+
+<pre>"{}": {{
+    "host": "{}",
+    "port": 22,
+    "user": "root",
+    "key_path": "/root/.ssh/gonka_key",
+}}</pre>""".format(server_ip.replace(".", "-"), ip))
     
     elif cmd == "/report":
         await send_report()
