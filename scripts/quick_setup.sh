@@ -1,20 +1,22 @@
 #!/bin/bash
 #
-# Gonka.ai Quick Node Setup Script
-# =================================
+# Gonka.ai Quick Node Setup Script v3.0
+# =====================================
 # This script sets up a Gonka compute node using Docker Compose.
 #
 # Usage:
-#   curl -fsSL https://your-domain.com/setup.sh | bash
-#   # or
+#   # With existing account (provide mnemonic when prompted):
 #   ./quick_setup.sh
 #
-# Required environment variables:
-#   GONKA_ACCOUNT_PUBKEY - Your Gonka account public key
+#   # With environment variables:
+#   export GONKA_MNEMONIC="your 24 word mnemonic..."
+#   export KEYRING_PASSWORD="yourpassword"
+#   ./quick_setup.sh
 #
 # Optional environment variables:
-#   GONKA_VERSION     - Version to install (default: latest)
-#   SKIP_NVIDIA       - Set to "1" to skip NVIDIA driver installation
+#   GONKA_MNEMONIC     - 24-word mnemonic for existing account
+#   KEYRING_PASSWORD   - Password for keyring (min 8 chars, default: gonkapass)
+#   SKIP_NVIDIA        - Set to "1" to skip NVIDIA driver installation
 #   SKIP_MODEL_DOWNLOAD - Set to "1" to skip model pre-download
 #
 
@@ -34,11 +36,11 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "\n${BOLD}[$1/$TOTAL_STEPS]${NC} $2"; }
 
-TOTAL_STEPS=8
+TOTAL_STEPS=10
 
 echo ""
 echo "╔══════════════════════════════════════╗"
-echo "║   Gonka.ai Node Setup Script v2.0    ║"
+echo "║   Gonka.ai Node Setup Script v3.0    ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 
@@ -48,17 +50,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Check for required environment variable
-if [ -z "$GONKA_ACCOUNT_PUBKEY" ]; then
-    log_warn "GONKA_ACCOUNT_PUBKEY not set"
-    echo ""
-    echo "To get your public key:"
-    echo "  1. Download inferenced CLI from https://github.com/gonka-ai/gonka/releases"
-    echo "  2. Run: inferenced keys add my-account --keyring-backend test"
-    echo "  3. Copy the 'key' value from the output"
-    echo ""
-    read -p "Enter your Gonka account public key (or press Enter to skip): " GONKA_ACCOUNT_PUBKEY
-fi
+# Set defaults
+KEYRING_PASSWORD="${KEYRING_PASSWORD:-gonkapass}"
+GONKA_DIR="/opt/gonka"
 
 # Detect OS
 if [ -f /etc/os-release ]; then
@@ -99,7 +93,7 @@ log_success "System updated"
 # ============================================================================
 log_step 2 "Installing dependencies..."
 
-$INSTALL_CMD curl wget git jq unzip
+$INSTALL_CMD curl wget git jq unzip expect
 log_success "Dependencies installed"
 
 # ============================================================================
@@ -126,7 +120,6 @@ if lspci 2>/dev/null | grep -i nvidia > /dev/null; then
             fi
         fi
         
-        # Show GPU info
         echo ""
         nvidia-smi --query-gpu=name,memory.total --format=csv 2>/dev/null || true
         echo ""
@@ -155,7 +148,6 @@ if [ "$HAS_GPU" = true ]; then
         log_info "Installing NVIDIA Container Toolkit..."
         
         if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
-            distribution="${OS}${VERSION_ID}"
             curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
                 gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
             curl -s -L "https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list" | \
@@ -173,11 +165,10 @@ if [ "$HAS_GPU" = true ]; then
 fi
 
 # ============================================================================
-# Step 5: Clone Gonka repository
+# Step 5: Clone Gonka repository and install CLI
 # ============================================================================
 log_step 5 "Setting up Gonka..."
 
-GONKA_DIR="/opt/gonka"
 if [ -d "$GONKA_DIR" ]; then
     log_info "Updating existing Gonka installation..."
     cd "$GONKA_DIR" && git pull --quiet
@@ -186,27 +177,166 @@ else
     git clone https://github.com/gonka-ai/gonka.git -b main "$GONKA_DIR" --quiet
 fi
 
+# Install inferenced CLI
+if ! command -v inferenced &> /dev/null; then
+    log_info "Installing inferenced CLI..."
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "x86_64" ]; then
+        ARCH="amd64"
+    elif [ "$ARCH" = "aarch64" ]; then
+        ARCH="arm64"
+    fi
+    
+    # Download from releases
+    RELEASE_URL="https://github.com/gonka-ai/gonka/releases/latest/download/inferenced-linux-${ARCH}"
+    if curl -fsSL -o /usr/local/bin/inferenced "$RELEASE_URL" 2>/dev/null; then
+        chmod +x /usr/local/bin/inferenced
+        log_success "inferenced CLI installed"
+    else
+        log_warn "Could not download inferenced CLI - will use docker version"
+    fi
+fi
+
 cd "$GONKA_DIR/deploy/join"
 log_success "Gonka repository ready"
 
 # ============================================================================
-# Step 6: Configure Gonka
+# Step 6: Setup Keys (Account Key + ML Ops Key)
 # ============================================================================
-log_step 6 "Configuring Gonka node..."
+log_step 6 "Setting up keys..."
+
+mkdir -p /root/.inference/keyring-file
+mkdir -p /root/.inference/keyring-test
+
+# Check if we have a mnemonic
+if [ -z "$GONKA_MNEMONIC" ]; then
+    echo ""
+    log_info "Do you have an existing Gonka account with a mnemonic?"
+    read -p "Enter 24-word mnemonic (or press Enter to create new account): " GONKA_MNEMONIC
+fi
+
+if [ -n "$GONKA_MNEMONIC" ]; then
+    # Import existing account
+    log_info "Importing account from mnemonic..."
+    
+    # Import to file backend with password using expect
+    expect << EOF
+spawn inferenced keys add gonka-account-key --recover --keyring-backend file
+expect "mnemonic"
+send "$GONKA_MNEMONIC\r"
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect eof
+EOF
+    
+    ACCOUNT_ADDRESS=$(inferenced keys show gonka-account-key --keyring-backend file -a 2>/dev/null < <(echo "$KEYRING_PASSWORD") || echo "")
+else
+    # Create new account
+    log_info "Creating new Gonka account..."
+    
+    expect << EOF
+spawn inferenced keys add gonka-account-key --keyring-backend file
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect eof
+EOF
+    
+    log_warn "SAVE YOUR MNEMONIC! It was displayed above."
+fi
+
+# Get account info
+ACCOUNT_INFO=$(echo "$KEYRING_PASSWORD" | inferenced keys show gonka-account-key --keyring-backend file 2>/dev/null || echo "")
+ACCOUNT_ADDRESS=$(echo "$ACCOUNT_INFO" | grep "address:" | awk '{print $2}')
+ACCOUNT_PUBKEY=$(echo "$ACCOUNT_INFO" | grep "key:" | sed 's/.*key":"\([^"]*\)".*/\1/')
+
+log_info "Account Address: $ACCOUNT_ADDRESS"
+
+# Create ML Ops Key
+log_info "Creating ML Ops key..."
+expect << EOF
+spawn inferenced keys add ml-ops-key --keyring-backend file
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect "passphrase"
+send "$KEYRING_PASSWORD\r"
+expect eof
+EOF
+
+ML_OPS_ADDRESS=$(echo "$KEYRING_PASSWORD" | inferenced keys show ml-ops-key --keyring-backend file -a 2>/dev/null || echo "")
+log_info "ML Ops Address: $ML_OPS_ADDRESS"
+
+log_success "Keys created"
+
+# ============================================================================
+# Step 7: Grant ML Ops Permissions
+# ============================================================================
+log_step 7 "Granting ML Ops permissions..."
+
+if [ -n "$ACCOUNT_ADDRESS" ] && [ -n "$ML_OPS_ADDRESS" ]; then
+    log_info "Submitting grant-ml-ops-permissions transaction..."
+    
+    echo "$KEYRING_PASSWORD" | inferenced tx inference grant-ml-ops-permissions \
+        gonka-account-key \
+        "$ML_OPS_ADDRESS" \
+        --from gonka-account-key \
+        --keyring-backend file \
+        --node http://node2.gonka.ai:26657 \
+        --chain-id gonka-mainnet \
+        --gas 1000000 \
+        -y 2>&1 | tail -5
+    
+    sleep 10
+    log_success "ML Ops permissions granted"
+else
+    log_warn "Skipping grant - keys not properly created"
+fi
+
+# ============================================================================
+# Step 8: Configure Gonka
+# ============================================================================
+log_step 8 "Configuring Gonka node..."
 
 # Create shared directory for models
 mkdir -p /mnt/shared
 
-# Create config.env
+# Create .env file (Docker Compose reads this automatically)
+cat > .env << EOF
+KEY_NAME=ml-ops-key
+KEYRING_PASSWORD=$KEYRING_PASSWORD
+KEYRING_BACKEND=file
+API_PORT=8000
+API_SSL_PORT=8443
+PUBLIC_URL=http://${SERVER_IP}:8000
+P2P_EXTERNAL_ADDRESS=tcp://${SERVER_IP}:5000
+ACCOUNT_PUBKEY=${ACCOUNT_PUBKEY}
+NODE_CONFIG=./node-config.json
+HF_HOME=/mnt/shared
+SEED_API_URL=http://node2.gonka.ai:8000
+SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
+SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
+DAPI_API__POC_CALLBACK_URL=http://api:9100
+DAPI_CHAIN_NODE__URL=http://node:26657
+DAPI_CHAIN_NODE__P2P_URL=http://node:26656
+RPC_SERVER_URL_1=http://node1.gonka.ai:26657
+RPC_SERVER_URL_2=http://node2.gonka.ai:26657
+PORT=8080
+INFERENCE_PORT=5050
+EOF
+
+# Also create config.env for shell sourcing
 cat > config.env << EOF
-export KEY_NAME=gonka-node
-export KEYRING_PASSWORD=
-export KEYRING_BACKEND=test
+export KEY_NAME=ml-ops-key
+export KEYRING_PASSWORD=$KEYRING_PASSWORD
+export KEYRING_BACKEND=file
 export API_PORT=8000
 export API_SSL_PORT=8443
 export PUBLIC_URL=http://${SERVER_IP}:8000
 export P2P_EXTERNAL_ADDRESS=tcp://${SERVER_IP}:5000
-export ACCOUNT_PUBKEY=${GONKA_ACCOUNT_PUBKEY}
+export ACCOUNT_PUBKEY=${ACCOUNT_PUBKEY}
 export NODE_CONFIG=./node-config.json
 export HF_HOME=/mnt/shared
 export SEED_API_URL=http://node2.gonka.ai:8000
@@ -221,18 +351,19 @@ export PORT=8080
 export INFERENCE_PORT=5050
 EOF
 
+# Copy keyring to deploy directory for containers
+mkdir -p .inference/keyring-file
+cp -r /root/.inference/keyring-file/* .inference/keyring-file/ 2>/dev/null || true
+
 log_success "Configuration created"
 
 # ============================================================================
-# Step 7: Start Gonka services
+# Step 9: Start Gonka services
 # ============================================================================
-log_step 7 "Starting Gonka services..."
-
-source config.env
+log_step 9 "Starting Gonka services..."
 
 # Pull images
 log_info "Pulling Docker images (this may take a while)..."
-docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull --quiet 2>/dev/null || \
 docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull 2>&1 | tail -5
 
 # Start containers
@@ -241,27 +372,42 @@ docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d 2>&1 | t
 log_success "Gonka services started"
 
 # Wait for services to be ready
-log_info "Waiting for services to initialize (60 seconds)..."
-sleep 60
+log_info "Waiting for services to initialize (90 seconds)..."
+sleep 90
 
 # ============================================================================
-# Step 8: Download required model
+# Step 10: Register Node & Download Model
 # ============================================================================
-log_step 8 "Downloading AI model..."
+log_step 10 "Registering node and downloading model..."
 
+# Register/update participant on network
+if [ -n "$ACCOUNT_ADDRESS" ]; then
+    log_info "Registering node on Gonka network..."
+    
+    echo "$KEYRING_PASSWORD" | inferenced tx inference submit-new-participant \
+        "http://${SERVER_IP}:8000" \
+        --keyring-backend file \
+        --from gonka-account-key \
+        --node http://node2.gonka.ai:26657 \
+        --chain-id gonka-mainnet \
+        --gas 1000000 \
+        -y 2>&1 | tail -3
+    
+    sleep 10
+    log_success "Node registered"
+fi
+
+# Download model
 if [ "$SKIP_MODEL_DOWNLOAD" != "1" ]; then
-    # Check which model is configured
     MODEL=$(cat node-config.json | jq -r '.[0].models | keys[0]' 2>/dev/null)
     
     if [ -n "$MODEL" ] && [ "$MODEL" != "null" ]; then
         log_info "Downloading model: $MODEL"
         
-        # Trigger download via MLNode API
         curl -s -X POST http://localhost:8080/api/v1/models/download \
             -H 'Content-Type: application/json' \
             -d "{\"hf_repo\": \"$MODEL\"}" > /dev/null 2>&1
         
-        # Wait for download
         log_info "Model download started. Checking progress..."
         
         DOWNLOAD_COMPLETE=false
@@ -284,14 +430,9 @@ if [ "$SKIP_MODEL_DOWNLOAD" != "1" ]; then
         if [ "$DOWNLOAD_COMPLETE" = true ]; then
             log_success "Model downloaded successfully"
         else
-            log_warn "Model download still in progress. Check status with:"
-            echo "  curl -s http://localhost:8080/api/v1/models/list | jq"
+            log_warn "Model download in progress. Check: curl -s http://localhost:8080/api/v1/models/list | jq"
         fi
-    else
-        log_warn "No model configured in node-config.json"
     fi
-else
-    log_info "Skipping model download (SKIP_MODEL_DOWNLOAD=1)"
 fi
 
 # ============================================================================
@@ -308,6 +449,12 @@ log_info "Container Status:"
 docker ps --format 'table {{.Names}}\t{{.Status}}' | head -10
 
 echo ""
+log_info "Account Information:"
+echo "  Address:       $ACCOUNT_ADDRESS"
+echo "  ML Ops:        $ML_OPS_ADDRESS"
+echo "  Keyring Pass:  $KEYRING_PASSWORD"
+
+echo ""
 log_info "Node Information:"
 echo "  Server IP:     $SERVER_IP"
 echo "  API URL:       http://$SERVER_IP:8000"
@@ -320,23 +467,27 @@ if [ "$HAS_GPU" = true ]; then
 fi
 
 echo ""
+log_info "Verify Registration:"
+echo "  curl -s 'http://node2.gonka.ai:8000/chain-api/productscience/inference/inference/participant/$ACCOUNT_ADDRESS' | jq"
+
+echo ""
 log_info "Useful Commands:"
-echo "  # Check node sync status"
+echo "  # Check sync status"
 echo "  curl -s http://localhost:26657/status | jq '.result.sync_info'"
 echo ""
 echo "  # Check MLNode health"
 echo "  curl -s http://localhost:8080/health | jq"
 echo ""
-echo "  # Check models"
-echo "  curl -s http://localhost:8080/api/v1/models/list | jq"
+echo "  # Check PoW status"
+echo "  curl -s http://localhost:9200/admin/v1/nodes | jq"
 echo ""
 echo "  # View logs"
-echo "  cd /opt/gonka/deploy/join"
-echo "  docker compose -f docker-compose.yml -f docker-compose.mlnode.yml logs -f"
+echo "  cd /opt/gonka/deploy/join && docker compose logs -f"
 echo ""
-echo "  # Restart services"
-echo "  cd /opt/gonka/deploy/join && source config.env"
-echo "  docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart"
+echo "  # Restart"
+echo "  cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart"
 echo ""
 
-log_success "Your Gonka node is now running! Happy earning! 💰"
+log_warn "IMPORTANT: Save your keyring password: $KEYRING_PASSWORD"
+echo ""
+log_success "Your Gonka node is ready! PoC validation happens every 24h. Happy earning! 💰"
