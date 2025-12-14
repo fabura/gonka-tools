@@ -71,7 +71,9 @@ def ssh_exec(host, cmd, config):
             timeout=15,
         )
         _, stdout, stderr = client.exec_command(cmd, timeout=30)
-        output = stdout.read().decode().strip()
+        out = stdout.read().decode(errors="replace").strip()
+        err = stderr.read().decode(errors="replace").strip()
+        output = out if out else err
         client.close()
         return True, output
     except Exception as e:
@@ -80,10 +82,10 @@ def ssh_exec(host, cmd, config):
 
 def sh_quote(cmd: str) -> str:
     """Wrap a command so it executes safely under a POSIX shell on the remote host."""
-    # `ssh_exec` runs the command via a remote shell, so we must prevent the shell
-    # from expanding awk variables like `$3` or `$i` before awk sees them.
+    # Prefer bash for consistent behavior; fall back to sh.
+    # We also must prevent the remote shell from expanding awk variables like `$3` or `$i`.
     safe = cmd.replace("$", "\\$")
-    return "sh -lc " + json.dumps(safe)
+    return "bash -lc " + json.dumps(safe)
 
 
 async def fetch_url(url, timeout=10):
