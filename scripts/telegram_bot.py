@@ -115,7 +115,7 @@ def get_full_status(name, config):
     status = {
         "name": name,
         "reachable": False,
-        "cpu": 0, "memory": 0, "disk": 0, "uptime": "",
+        "cpu": 0, "memory": 0, "disk": 0, "disk_free_gb": 0.0, "uptime": "",
         "gpu_names": [], "gpu_temps": [], "gpu_util": [], "gpu_mem": [],
         "containers": 0, "containers_healthy": 0, "unhealthy": [],
         "sync_block": "0", "synced": False,
@@ -147,6 +147,11 @@ def get_full_status(name, config):
     ok, out = ssh_exec(name, "df -P / | awk 'END{gsub(/%/,\"\",$5); print $5}'", config)
     if ok and out:
         try: status["disk"] = float(out.replace("%", ""))
+        except: pass
+
+    ok, out = ssh_exec(name, "df -PBG / | awk 'END{gsub(/G/,\"\",$4); print $4}'", config)
+    if ok and out:
+        try: status["disk_free_gb"] = float(out.strip())
         except: pass
     
     ok, out = ssh_exec(name, "uptime -p", config)
@@ -319,7 +324,7 @@ def format_status_message(s, earnings):
     return """<b>{name}</b>
 
 <b>📊 System</b>
-  CPU: {cpu:.0f}% | RAM: {mem:.0f}% | Disk: {disk:.0f}%
+  CPU: {cpu:.0f}% | RAM: {mem:.0f}% | Disk: {disk:.0f}% ({disk_free:.0f}GB free)
   {uptime}
 
 <b>🖥 GPUs</b>
@@ -345,6 +350,7 @@ def format_status_message(s, earnings):
   {containers_ok}/{containers_total} healthy{unhealthy}""".format(
         name=s["name"],
         cpu=s["cpu"], mem=s["memory"], disk=s["disk"],
+        disk_free=s.get("disk_free_gb", 0.0),
         uptime=s["uptime"],
         gpu=gpu_text,
         sync_icon=sync_icon,
