@@ -78,6 +78,14 @@ def ssh_exec(host, cmd, config):
         return False, str(e)
 
 
+def sh_quote(cmd: str) -> str:
+    """Wrap a command so it executes safely under a POSIX shell on the remote host."""
+    # `ssh_exec` runs the command via a remote shell, so we must prevent the shell
+    # from expanding awk variables like `$3` or `$i` before awk sees them.
+    safe = cmd.replace("$", "\\$")
+    return "sh -lc " + json.dumps(safe)
+
+
 async def fetch_url(url, timeout=10):
     try:
         async with httpx.AsyncClient() as client:
@@ -132,24 +140,26 @@ def get_full_status(name, config):
     # System
     ok, out = ssh_exec(
         name,
-        "top -bn1 | awk -F',' '/Cpu\\(s\\)/{for(i=1;i<=NF;i++){if($i~/%id/){gsub(/[^0-9.]/,\"\",$i); print 100-$i; exit}}}'",
+        sh_quote(
+            "top -bn1 | awk -F',' '/Cpu\\(s\\)/{for(i=1;i<=NF;i++){if($i~/%id/){gsub(/[^0-9.]/, \"\", $i); print 100-$i; exit}}}'"
+        ),
         config,
     )
     if ok and out:
         try: status["cpu"] = float(out.replace("%", ""))
         except: pass
     
-    ok, out = ssh_exec(name, "free | awk '/Mem:/{print ($3/$2)*100.0}'", config)
+    ok, out = ssh_exec(name, sh_quote("free | awk '/Mem:/{print ($3/$2)*100.0}'"), config)
     if ok and out:
         try: status["memory"] = float(out)
         except: pass
     
-    ok, out = ssh_exec(name, "df -P / | awk 'END{gsub(/%/,\"\",$5); print $5}'", config)
+    ok, out = ssh_exec(name, sh_quote("df -P / | awk 'END{gsub(/%/,\"\",$5); print $5}'"), config)
     if ok and out:
         try: status["disk"] = float(out.replace("%", ""))
         except: pass
 
-    ok, out = ssh_exec(name, "df -PBG / | awk 'END{gsub(/G/,\"\",$4); print $4}'", config)
+    ok, out = ssh_exec(name, sh_quote("df -PBG / | awk 'END{gsub(/G/,\"\",$4); print $4}'"), config)
     if ok and out:
         try: status["disk_free_gb"] = float(out.strip())
         except: pass
