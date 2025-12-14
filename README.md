@@ -15,7 +15,7 @@ A comprehensive toolkit for managing Gonka.ai compute nodes, monitoring their he
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/gonka-tools.git
+git clone https://github.com/fabura/gonka-tools.git
 cd gonka-tools
 
 # Create virtual environment
@@ -175,6 +175,54 @@ global:
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram
 2. Get your chat ID by messaging [@userinfobot](https://t.me/userinfobot)
 3. Add the bot token and chat ID to your `.env` file
+
+## Recommended Model Setup (Gonka Hosts)
+
+If you want to serve a **Gonka-recommended model**, this toolchain has been validated end-to-end with:
+
+- **Model**: `Qwen/Qwen3-32B-FP8`
+- **Deployment**: MLNode `/api/v1/inference/up` using **`additional_args`** (NOT `config.args`)
+
+### Known-good deploy payload (fixes KV cache/max seq issues)
+
+The MLNode API schema for `/api/v1/inference/up` is:
+- `model` (string)
+- `dtype` (string)
+- `additional_args` (string[])
+
+If you deploy `Qwen/Qwen3-32B-FP8` without setting `--max-model-len`, vLLM may fail with a KV cache error (max seq len 40960 > KV cache tokens).
+
+Use this payload (example uses 2 GPUs):
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/inference/up \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-32B-FP8",
+    "dtype": "float16",
+    "additional_args": [
+      "--tensor-parallel-size","2",
+      "--pipeline-parallel-size","1",
+      "--quantization","fp8",
+      "--kv-cache-dtype","fp8",
+      "--gpu-memory-utilization","0.95",
+      "--max-model-len","32768"
+    ]
+  }'
+```
+
+Verify:
+
+```bash
+curl -s http://localhost:8080/api/v1/state | jq
+curl -s http://localhost:8080/api/v1/models/list | jq
+```
+
+## Disk Space Control (Highly Recommended)
+
+Gonka chain state can grow quickly (especially `application.db`). To keep space under control, enable pruning and, if needed, reset large DBs following the official guidance:
+
+- Official FAQ: `https://gonka.ai/FAQ/#why-is-my-applicationdb-growing-so-large-and-how-do-i-fix-it`
 
 ## Deploying Local Monitoring
 

@@ -1,32 +1,55 @@
 #!/usr/bin/env python3
 """
-Gonka.ai Telegram Bot v3 - Complete Node Monitoring
+Gonka.ai Telegram Bot - Node monitoring + installer
+
+Security:
+- Do NOT hardcode bot tokens, chat IDs, wallet addresses, or server IPs here.
+- This script loads configuration from environment variables and a nodes.yaml file.
 """
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from datetime import datetime
 
 import httpx
 import paramiko
+import yaml
 
 # Configuration
-BOT_TOKEN = "8228176154:AAFEqKsG8lIBIW_3CztABKTsfRX5HMhOHTk"
-ALLOWED_CHAT_ID = 98662716
-WALLET_ADDRESS = "gonka1k82cpjqhfgt347x7grdudu7zfaew6strzjwhyl"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+ALLOWED_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+WALLET_ADDRESS = os.environ.get("GONKA_WALLET_ADDRESS", "").strip()
+PUBLIC_API = os.environ.get("GONKA_PUBLIC_API", "http://node2.gonka.ai:8000").strip()
+NODES_YAML_PATH = os.environ.get("NODES_YAML_PATH", "./config/nodes.yaml").strip()
+DEFAULT_MODEL_HF_REPO = os.environ.get("DEFAULT_MODEL_HF_REPO", "Qwen/Qwen3-32B-FP8").strip()
 
-NODES = {
-    "neon-galaxy-fin-01": {
-        "host": "65.108.33.117",
-        "port": 22,
-        "user": "root",
-        "key_path": "/root/.ssh/gonka_key",
-    }
-}
 
-PUBLIC_API = "http://node2.gonka.ai:8000"
+def load_nodes() -> dict:
+    """Load nodes from nodes.yaml (see config/nodes.yaml.example)."""
+    try:
+        with open(NODES_YAML_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+    nodes = {}
+    for n in data.get("nodes", []) or []:
+        name = n.get("name")
+        if not name:
+            continue
+        nodes[name] = {
+            "host": n.get("host"),
+            "port": int(n.get("port", 22)),
+            "user": n.get("user", "root"),
+            "key_path": os.path.expanduser(n.get("ssh_key") or "~/.ssh/gonka_key"),
+        }
+    return nodes
+
+
+NODES = load_nodes()
 
 CHECK_INTERVAL = 300
 REPORT_INTERVAL = 1800
@@ -107,17 +130,21 @@ def get_full_status(name, config):
     status["reachable"] = True
     
     # System
-    ok, out = ssh_exec(name, "top -bn1 | grep 'Cpu(s)' | awk '{print \}'", config)
+    ok, out = ssh_exec(
+        name,
+        "top -bn1 | awk -F',' '/Cpu\\(s\\)/{for(i=1;i<=NF;i++){if($i~/%id/){gsub(/[^0-9.]/,\"\",$i); print 100-$i; exit}}}'",
+        config,
+    )
     if ok and out:
         try: status["cpu"] = float(out.replace("%", ""))
         except: pass
     
-    ok, out = ssh_exec(name, "free | grep Mem | awk '{print (\/\) * 100}'", config)
+    ok, out = ssh_exec(name, "free | awk '/Mem:/{print ($3/$2)*100.0}'", config)
     if ok and out:
         try: status["memory"] = float(out)
         except: pass
     
-    ok, out = ssh_exec(name, "df -h / | tail -1 | awk '{print \}'", config)
+    ok, out = ssh_exec(name, "df -P / | awk 'END{gsub(/%/,\"\",$5); print $5}'", config)
     if ok and out:
         try: status["disk"] = float(out.replace("%", ""))
         except: pass
@@ -652,20 +679,21 @@ ENVEOF
         await asyncio.sleep(90)
         
         # Download model
-        await send_message(chat_id, "📥 Downloading model (Qwen/Qwen2.5-7B-Instruct)...")
+        model_repo = os.environ.get("DEFAULT_MODEL_HF_REPO", "Qwen/Qwen3-32B-FP8")
+        await send_message(chat_id, f"📥 Downloading model ({model_repo})...")
         ok, _ = ssh_exec(ip, """
             curl -s -X POST http://localhost:8080/api/v1/models/download \
                 -H 'Content-Type: application/json' \
-                -d '{"hf_repo": "Qwen/Qwen2.5-7B-Instruct"}' > /dev/null 2>&1
-        """, config)
+                -d '{"hf_repo": "%s"}' > /dev/null 2>&1
+        """ % model_repo, config)
         
         # Check model status after a bit
         await asyncio.sleep(30)
         ok, model_status = ssh_exec(ip, """
             curl -s -X POST http://localhost:8080/api/v1/models/status \
                 -H 'Content-Type: application/json' \
-                -d '{"hf_repo": "Qwen/Qwen2.5-7B-Instruct"}' 2>/dev/null | jq -r '.status' 2>/dev/null || echo 'UNKNOWN'
-        """, config)
+                -d '{"hf_repo": "%s"}' 2>/dev/null | jq -r '.status' 2>/dev/null || echo 'UNKNOWN'
+        """ % model_repo, config)
         
         ok, status = ssh_exec(ip, "docker ps --format '{{.Names}}: {{.Status}}' | head -8", config)
         
@@ -747,6 +775,14 @@ ENVEOF
             curl -s http://localhost:8080/api/v1/models/list 2>/dev/null | jq -r '.models[0] | .model.hf_repo + ": " + .status'
         """, config)
         model_final_msg = model_final if ok and model_final else model_msg
+
+        # Attempt to deploy the model (Qwen3-32B-FP8 requires max-model-len tuning)
+        await send_message(chat_id, "🚀 Deploying model (starting vLLM)...")
+        deploy_cmd = f"""curl -sS -X POST http://localhost:8080/api/v1/inference/up \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"model":"{model_repo}","dtype":"float16","additional_args":["--tensor-parallel-size","2","--pipeline-parallel-size","1","--quantization","fp8","--kv-cache-dtype","fp8","--gpu-memory-utilization","0.95","--max-model-len","32768"]}}'"""
+        ok, deploy_out = ssh_exec(ip, deploy_cmd, config)
+        deploy_msg = "✅ Deploy started" if ok and ("OK" in deploy_out or "status" in deploy_out) else f"⚠️ Deploy: {deploy_out[:120]}"
         
         await send_message(chat_id, """✅ <b>Installation Complete!</b>
 
@@ -773,6 +809,7 @@ ENVEOF
 
 <b>📦 Model:</b>
   {}
+  {}
 
 <b>🐳 Containers:</b>
 <pre>{}</pre>
@@ -785,6 +822,7 @@ ENVEOF
             admin_msg,
             participant_msg,
             model_final_msg,
+            deploy_msg,
             status,
             "🎉 Ready! PoC runs every 24h." if "INFERENCE" in str(mlnode_msg) else "⏳ Starting up... Check /status in a few minutes."
         ))
@@ -884,6 +922,11 @@ async def periodic_tasks():
 
 async def main():
     print("Gonka Bot v3 started at {}".format(datetime.now()))
+
+    if not BOT_TOKEN or not ALLOWED_CHAT_ID:
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in environment")
+    if not NODES:
+        raise SystemExit(f"No nodes loaded. Set NODES_YAML_PATH (currently: {NODES_YAML_PATH})")
     
     await send_message(ALLOWED_CHAT_ID, """🤖 <b>Gonka Bot v3 Online!</b>
 

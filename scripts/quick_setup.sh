@@ -302,7 +302,8 @@ fi
 # ============================================================================
 log_step 8 "Configuring Gonka node..."
 
-# Create shared directory for models
+# Create shared directory for model cache.
+# NOTE: The MLNode container mounts host `/mnt/shared` to container `/root/.cache`.
 mkdir -p /mnt/shared
 
 # Create .env file (Docker Compose reads this automatically)
@@ -316,7 +317,11 @@ PUBLIC_URL=http://${SERVER_IP}:8000
 P2P_EXTERNAL_ADDRESS=tcp://${SERVER_IP}:5000
 ACCOUNT_PUBKEY=${ACCOUNT_PUBKEY}
 NODE_CONFIG=./node-config.json
-HF_HOME=/mnt/shared
+# IMPORTANT:
+# MLNode uses `/root/.cache/hub` as the HuggingFace cache location.
+# In Gonka docker-compose, `/root/.cache` is bind-mounted to host `/mnt/shared`,
+# so model downloads persist on the host.
+HF_HOME=/root/.cache
 SEED_API_URL=http://node2.gonka.ai:8000
 SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
 SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
@@ -340,7 +345,7 @@ export PUBLIC_URL=http://${SERVER_IP}:8000
 export P2P_EXTERNAL_ADDRESS=tcp://${SERVER_IP}:5000
 export ACCOUNT_PUBKEY=${ACCOUNT_PUBKEY}
 export NODE_CONFIG=./node-config.json
-export HF_HOME=/mnt/shared
+export HF_HOME=/root/.cache
 export SEED_API_URL=http://node2.gonka.ai:8000
 export SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
 export SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
@@ -399,7 +404,11 @@ log_info "Run this on your local machine if this is a new node or you changed th
 
 # Download model
 if [ "$SKIP_MODEL_DOWNLOAD" != "1" ]; then
-    MODEL=$(cat node-config.json | jq -r '.[0].models | keys[0]' 2>/dev/null)
+    # Prefer a well-known Gonka-recommended model, override via env if desired.
+    MODEL="${DEFAULT_MODEL_HF_REPO:-}"
+    if [ -z "$MODEL" ]; then
+        MODEL=$(cat node-config.json | jq -r '.[0].models | keys[0]' 2>/dev/null)
+    fi
     
     if [ -n "$MODEL" ] && [ "$MODEL" != "null" ]; then
         log_info "Downloading model: $MODEL"
@@ -504,3 +513,9 @@ echo "  - Grant command: /opt/gonka/grant_permissions.sh"
 echo "  - Register command: /opt/gonka/register_node.sh"
 echo ""
 log_success "Server setup complete! Run the grant command from your local machine to start earning! 💰"
+
+echo ""
+log_info "Recommended: Deploy the model (works for Qwen/Qwen3-32B-FP8 on 2 GPUs):"
+echo "  curl -sS -X POST http://localhost:8080/api/v1/inference/up \\"
+echo "    -H 'Content-Type: application/json' \\"
+echo "    -d '{\"model\":\"Qwen/Qwen3-32B-FP8\",\"dtype\":\"float16\",\"additional_args\":[\"--tensor-parallel-size\",\"2\",\"--pipeline-parallel-size\",\"1\",\"--quantization\",\"fp8\",\"--kv-cache-dtype\",\"fp8\",\"--gpu-memory-utilization\",\"0.95\",\"--max-model-len\",\"32768\"]}'"
