@@ -13,6 +13,7 @@ import os
 import subprocess
 import time
 from datetime import datetime
+from typing import List
 
 import httpx
 import paramiko
@@ -105,7 +106,7 @@ def hf_cache_dir_for_repo(hf_repo: str) -> str:
     return "/mnt/shared/hub/models--" + hf_repo.replace("/", "--")
 
 
-def pick_inference_args(hf_repo: str, gpu_count: int) -> list[str]:
+def pick_inference_args(hf_repo: str, gpu_count: int) -> List[str]:
     """Pick known-good vLLM args for common Gonka models."""
     tp = max(1, int(gpu_count or 1))
     tp = 2 if tp >= 2 else 1
