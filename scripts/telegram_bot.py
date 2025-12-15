@@ -105,6 +105,30 @@ def hf_cache_dir_for_repo(hf_repo: str) -> str:
     return "/mnt/shared/hub/models--" + hf_repo.replace("/", "--")
 
 
+def pick_inference_args(hf_repo: str, gpu_count: int) -> list[str]:
+    """Pick known-good vLLM args for common Gonka models."""
+    tp = max(1, int(gpu_count or 1))
+    tp = 2 if tp >= 2 else 1
+
+    if hf_repo == "Qwen/Qwen3-32B-FP8":
+        return [
+            "--tensor-parallel-size", str(tp),
+            "--pipeline-parallel-size", "1",
+            "--quantization", "fp8",
+            "--kv-cache-dtype", "fp8",
+            "--gpu-memory-utilization", "0.95",
+            "--max-model-len", "32768",
+        ]
+
+    # Default: small/medium fp8 run (no special max-model-len needed)
+    return [
+        "--tensor-parallel-size", str(tp),
+        "--pipeline-parallel-size", "1",
+        "--quantization", "fp8",
+        "--gpu-memory-utilization", "0.90",
+    ]
+
+
 async def fetch_url(url, timeout=10):
     try:
         async with httpx.AsyncClient() as client:
@@ -461,6 +485,8 @@ async def handle_update(update):
 /earnings - Balance & epoch stats  
 /sync - Blockchain sync
 /models - Downloaded models
+/epoch_model - Show controller epoch model
+/align - Download + deploy controller epoch model (single-model mode)
 /logs - Recent logs
 /restart - Restart services
 /pow - PoW/PoC status
@@ -523,6 +549,129 @@ Epochs completed: {}
             else:
                 text = "📦 No models downloaded"
             await send_message(chat_id, text)
+
+    elif cmd == "/epoch_model":
+        for name, config in NODES.items():
+            ok, out = ssh_exec(name, "curl -s http://localhost:9200/admin/v1/nodes 2>/dev/null", config)
+            if not ok or not out:
+                await send_message(chat_id, f"❌ {name}: cannot reach controller admin API on :9200 (is `api` container running?)")
+                continue
+            try:
+                data = json.loads(out)
+                state = (data[0] or {}).get("state", {}) if isinstance(data, list) and data else {}
+                epoch_models = list((state.get("epoch_models") or {}).keys())
+                await send_message(
+                    chat_id,
+                    "📌 <b>{}</b>\n"
+                    "<b>Node:</b> {} → {}\n"
+                    "<b>PoC:</b> {} → {}\n"
+                    "<b>Epoch models:</b>\n  {}".format(
+                        name,
+                        state.get("intended_status", "UNKNOWN"),
+                        state.get("current_status", "UNKNOWN"),
+                        state.get("poc_intended_status", "UNKNOWN"),
+                        state.get("poc_current_status", "UNKNOWN"),
+                        "\n  ".join(epoch_models) if epoch_models else "None",
+                    ),
+                )
+            except Exception as e:
+                await send_message(chat_id, f"❌ {name}: failed to parse admin API: {str(e)[:120]}")
+
+    elif cmd == "/align":
+        # Align to controller epoch model: cleanup (single-model), download, deploy, verify.
+        target_name = list(NODES.keys())[0]
+        target = NODES[target_name]
+
+        await send_message(chat_id, f"🧭 Aligning <b>{target_name}</b> to controller epoch model...")
+
+        ok, out = ssh_exec(target_name, "curl -s http://localhost:9200/admin/v1/nodes 2>/dev/null", target)
+        if not ok or not out:
+            await send_message(chat_id, "❌ Controller admin API not reachable on :9200. Start it with:\n<pre>cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d</pre>")
+            return
+
+        try:
+            data = json.loads(out)
+            state = (data[0] or {}).get("state", {}) if isinstance(data, list) and data else {}
+            epoch_models = list((state.get("epoch_models") or {}).keys())
+            epoch_model = epoch_models[0] if epoch_models else ""
+        except Exception as e:
+            await send_message(chat_id, f"❌ Failed to parse controller epoch_models: {str(e)[:120]}")
+            return
+
+        if not epoch_model:
+            await send_message(chat_id, "❌ No epoch model assigned by controller.")
+            return
+
+        # GPU count for TP sizing
+        ok, out = ssh_exec(target_name, "nvidia-smi -L 2>/dev/null | wc -l", target)
+        gpu_count = 2
+        if ok and out.strip().isdigit():
+            gpu_count = int(out.strip())
+
+        await send_message(chat_id, f"📌 Epoch model: <b>{epoch_model}</b> (GPUs: {gpu_count})")
+
+        # Stop inference (required)
+        ssh_exec(target_name, "curl -s -X POST http://localhost:8080/api/v1/inference/down -H 'Content-Type: application/json' >/dev/null 2>&1 || true", target)
+
+        # Single-model mode cleanup on target host
+        if SINGLE_MODEL_MODE:
+            keep_dir = hf_cache_dir_for_repo(epoch_model)
+            cleanup_cmd = f"""set -e
+rm -rf /mnt/shared/xet/* 2>/dev/null || true
+if [ -d /mnt/shared/hub ]; then
+  for d in /mnt/shared/hub/models--*; do
+    [ "$d" = "{keep_dir}" ] && continue
+    rm -rf "$d" || true
+  done
+fi
+df -h / | tail -1
+"""
+            ssh_exec(target_name, cleanup_cmd, target)
+
+        # Download model
+        await send_message(chat_id, "📥 Downloading model...")
+        ssh_exec(
+            target_name,
+            f"curl -s -X POST http://localhost:8080/api/v1/models/download -H 'Content-Type: application/json' -d '{{\"hf_repo\":\"{epoch_model}\"}}' >/dev/null 2>&1 || true",
+            target,
+        )
+
+        # Wait until downloaded (best-effort)
+        for i in range(1, 61):
+            ok, out = ssh_exec(target_name, "curl -s http://localhost:8080/api/v1/models/list 2>/dev/null", target)
+            status = ""
+            try:
+                j = json.loads(out) if out else {}
+                for m in j.get("models", []):
+                    if (m.get("model") or {}).get("hf_repo") == epoch_model:
+                        status = m.get("status", "")
+                        break
+            except Exception:
+                status = ""
+
+            if status == "DOWNLOADED":
+                break
+
+            if i in (1, 5, 10, 20, 30, 40, 50, 60):
+                ok2, disk = ssh_exec(target_name, "df -h / | tail -1", target)
+                await send_message(chat_id, f"⏳ Download status: {status or 'UNKNOWN'} (check {i}/60)\n<pre>{disk if ok2 else ''}</pre>")
+            await asyncio.sleep(20)
+
+        # Deploy model (inference/up)
+        args = pick_inference_args(epoch_model, gpu_count)
+        payload = {"model": epoch_model, "dtype": "float16", "additional_args": args}
+        deploy_cmd = "curl -sS -X POST http://localhost:8080/api/v1/inference/up -H 'Content-Type: application/json' -d '{}'".format(
+            json.dumps(payload).replace("'", "\\'")
+        )
+        ok, out = ssh_exec(target_name, deploy_cmd, target)
+        if not ok:
+            await send_message(chat_id, f"❌ Deploy failed: {out[:500]}")
+            return
+
+        await send_message(chat_id, f"🚀 Deploy triggered. Waiting for INFERENCE...")
+        await asyncio.sleep(45)
+        ok, state_out = ssh_exec(target_name, "curl -s http://localhost:8080/api/v1/state 2>/dev/null", target)
+        await send_message(chat_id, f"✅ Align complete.\n<pre>{state_out[-2000:] if state_out else ''}</pre>")
     
     elif cmd == "/logs":
         name = list(NODES.keys())[0]
