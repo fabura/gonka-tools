@@ -55,6 +55,10 @@ CHECK_INTERVAL = 300
 REPORT_INTERVAL = 1800
 ALERT_COOLDOWN = 600
 
+# Free disk space alert (GB). Percent-only alerts are not enough because a big disk at 90%
+# can still have lots of space, while a smaller disk can be dangerously low.
+DISK_FREE_GB_ALERT_THRESHOLD = float(os.environ.get("DISK_FREE_GB_ALERT_THRESHOLD", "15"))
+
 _last_alerts = {}
 _last_report = 0
 
@@ -927,6 +931,18 @@ async def check_alerts():
             key = "{}:containers".format(name)
             if key not in _last_alerts or now - _last_alerts[key] > ALERT_COOLDOWN:
                 await send_message(ALLOWED_CHAT_ID, "⚠️ <b>{}</b> unhealthy: {}".format(name, ", ".join(s["unhealthy"])))
+                _last_alerts[key] = now
+
+        # Low free disk space (GB)
+        if s.get("disk_free_gb") is not None and s["disk_free_gb"] <= DISK_FREE_GB_ALERT_THRESHOLD:
+            key = "{}:disk_free".format(name)
+            if key not in _last_alerts or now - _last_alerts[key] > ALERT_COOLDOWN:
+                await send_message(
+                    ALLOWED_CHAT_ID,
+                    "🚨 <b>{}</b> low disk space: <b>{:.1f} GB free</b> (threshold: {:.0f} GB)".format(
+                        name, s["disk_free_gb"], DISK_FREE_GB_ALERT_THRESHOLD
+                    ),
+                )
                 _last_alerts[key] = now
 
 
