@@ -47,11 +47,11 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "\n${BOLD}[$1/$TOTAL_STEPS]${NC} $2"; }
 
-TOTAL_STEPS=10
+TOTAL_STEPS=11
 
 echo ""
 echo "╔══════════════════════════════════════╗"
-echo "║   Gonka.ai Node Setup Script v3.0    ║"
+echo "║   Gonka.ai Node Setup Script v3.2    ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 
@@ -104,7 +104,7 @@ log_success "System updated"
 # ============================================================================
 log_step 2 "Installing dependencies..."
 
-$INSTALL_CMD curl wget git jq unzip expect
+$INSTALL_CMD curl wget git jq unzip expect python3
 log_success "Dependencies installed"
 
 # ============================================================================
@@ -176,9 +176,47 @@ if [ "$HAS_GPU" = true ]; then
 fi
 
 # ============================================================================
-# Step 5: Clone Gonka repository and install CLI
+# Step 5: Configure Docker log rotation (prevents disk from filling)
 # ============================================================================
-log_step 5 "Setting up Gonka..."
+log_step 5 "Configuring Docker log rotation..."
+
+# Defaults (override if you want different rotation)
+DOCKER_LOG_MAX_SIZE="${DOCKER_LOG_MAX_SIZE:-50m}"
+DOCKER_LOG_MAX_FILE="${DOCKER_LOG_MAX_FILE:-3}"
+
+mkdir -p /etc/docker
+
+# Merge into existing daemon.json when possible; otherwise create a minimal config.
+python3 - <<PY
+import json, os, shutil
+path = "/etc/docker/daemon.json"
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f) or {}
+    except Exception:
+        shutil.copy2(path, path + ".bak")
+        cfg = {}
+
+cfg["log-driver"] = cfg.get("log-driver", "json-file")
+cfg.setdefault("log-opts", {})
+cfg["log-opts"]["max-size"] = os.environ.get("DOCKER_LOG_MAX_SIZE", "50m")
+cfg["log-opts"]["max-file"] = os.environ.get("DOCKER_LOG_MAX_FILE", "3")
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+print(f"Wrote {path}")
+PY
+
+systemctl restart docker
+log_success "Docker log rotation enabled (max-size=$DOCKER_LOG_MAX_SIZE, max-file=$DOCKER_LOG_MAX_FILE)"
+
+# ============================================================================
+# Step 6: Clone Gonka repository and install CLI
+# ============================================================================
+log_step 6 "Setting up Gonka..."
 
 if [ -d "$GONKA_DIR" ]; then
     log_info "Updating existing Gonka installation..."
@@ -212,9 +250,9 @@ cd "$GONKA_DIR/deploy/join"
 log_success "Gonka repository ready"
 
 # ============================================================================
-# Step 6: Setup ML Ops Key (Hot Wallet - safe to keep on server)
+# Step 7: Setup ML Ops Key (Hot Wallet - safe to keep on server)
 # ============================================================================
-log_step 6 "Setting up ML Ops key..."
+log_step 7 "Setting up ML Ops key..."
 
 mkdir -p /root/.inference/keyring-file
 mkdir -p /root/.inference/keyring-test
@@ -266,9 +304,9 @@ log_success "ML Ops key created"
 log_warn "The ML Ops key mnemonic was displayed above. Save it for backup!"
 
 # ============================================================================
-# Step 7: Instructions for Granting ML Ops Permissions
+# Step 8: Instructions for Granting ML Ops Permissions
 # ============================================================================
-log_step 7 "ML Ops permissions setup..."
+log_step 8 "ML Ops permissions setup..."
 
 # Save the grant command for the user
 GRANT_CMD="inferenced tx inference grant-ml-ops-permissions \\
@@ -298,9 +336,9 @@ if [ "$GRANT_DONE" != "y" ] && [ "$GRANT_DONE" != "Y" ]; then
 fi
 
 # ============================================================================
-# Step 8: Configure Gonka
+# Step 9: Configure Gonka
 # ============================================================================
-log_step 8 "Configuring Gonka node..."
+log_step 9 "Configuring Gonka node..."
 
 # Create shared directory for model cache.
 # NOTE: The MLNode container mounts host `/mnt/shared` to container `/root/.cache`.
@@ -365,9 +403,9 @@ cp -r /root/.inference/keyring-file/* .inference/keyring-file/ 2>/dev/null || tr
 log_success "Configuration created"
 
 # ============================================================================
-# Step 9: Start Gonka services
+# Step 10: Start Gonka services
 # ============================================================================
-log_step 9 "Starting Gonka services..."
+log_step 10 "Starting Gonka services..."
 
 # Pull images
 log_info "Pulling Docker images (this may take a while)..."
@@ -383,9 +421,9 @@ log_info "Waiting for services to initialize (90 seconds)..."
 sleep 90
 
 # ============================================================================
-# Step 10: Register Node & Download Model
+# Step 11: Register Node & Download Model
 # ============================================================================
-log_step 10 "Registering node and downloading model..."
+log_step 11 "Registering node and downloading model..."
 
 # Save registration command for user
 REGISTER_CMD="inferenced tx inference submit-new-participant \\
