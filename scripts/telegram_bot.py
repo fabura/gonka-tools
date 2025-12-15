@@ -88,6 +88,13 @@ def sh_quote(cmd: str) -> str:
     return "bash -lc " + json.dumps(safe)
 
 
+def _to_float(s: str):
+    try:
+        return float(str(s).strip())
+    except Exception:
+        return None
+
+
 async def fetch_url(url, timeout=10):
     try:
         async with httpx.AsyncClient() as client:
@@ -125,7 +132,7 @@ def get_full_status(name, config):
     status = {
         "name": name,
         "reachable": False,
-        "cpu": 0, "memory": 0, "disk": 0, "disk_free_gb": 0.0, "uptime": "",
+        "cpu": None, "memory": None, "disk": None, "disk_free_gb": None, "uptime": "",
         "gpu_names": [], "gpu_temps": [], "gpu_util": [], "gpu_mem": [],
         "containers": 0, "containers_healthy": 0, "unhealthy": [],
         "sync_block": "0", "synced": False,
@@ -139,32 +146,51 @@ def get_full_status(name, config):
         return status
     status["reachable"] = True
     
-    # System
+    # System (avoid awk $-field expansion issues by parsing with python)
     ok, out = ssh_exec(
         name,
         sh_quote(
-            "top -bn1 | awk -F',' '/Cpu\\(s\\)/{for(i=1;i<=NF;i++){if($i~/%id/){gsub(/[^0-9.]/, \"\", $i); print 100-$i; exit}}}'"
+            "python3 -c 'import re,subprocess; "
+            "s=subprocess.check_output([\"top\",\"-bn1\"], text=True, stderr=subprocess.STDOUT); "
+            "m=re.search(r\"%Cpu\\(s\\):.*?([0-9.]+)\\s*id\", s); "
+            "print(100-float(m.group(1)) if m else \"\")'"
         ),
         config,
     )
     if ok and out:
-        try: status["cpu"] = float(out.replace("%", ""))
-        except: pass
-    
-    ok, out = ssh_exec(name, sh_quote("free | awk '/Mem:/{print ($3/$2)*100.0}'"), config)
-    if ok and out:
-        try: status["memory"] = float(out)
-        except: pass
-    
-    ok, out = ssh_exec(name, sh_quote("df -P / | awk 'END{gsub(/%/,\"\",$5); print $5}'"), config)
-    if ok and out:
-        try: status["disk"] = float(out.replace("%", ""))
-        except: pass
+        status["cpu"] = _to_float(out.replace("%", ""))
 
-    ok, out = ssh_exec(name, sh_quote("df -PBG / | awk 'END{gsub(/G/,\"\",$4); print $4}'"), config)
+    ok, out = ssh_exec(
+        name,
+        sh_quote(
+            "python3 -c 'import subprocess; "
+            "s=subprocess.check_output([\"free\",\"-b\"], text=True, stderr=subprocess.STDOUT).splitlines(); "
+            "mem=[l for l in s if l.startswith(\"Mem:\")][0].split(); "
+            "total=int(mem[1]); used=int(mem[2]); "
+            "print((used/total)*100.0 if total else \"\")'"
+        ),
+        config,
+    )
     if ok and out:
-        try: status["disk_free_gb"] = float(out.strip())
-        except: pass
+        status["memory"] = _to_float(out)
+
+    ok, out = ssh_exec(
+        name,
+        sh_quote(
+            "python3 -c 'import subprocess; "
+            "l=subprocess.check_output([\"df\",\"-P\",\"-B1\",\"/\"], text=True, stderr=subprocess.STDOUT).splitlines()[-1].split(); "
+            "total=int(l[1]); used=int(l[2]); avail=int(l[3]); "
+            "print(((used/total)*100.0 if total else \"\")); "
+            "print(avail/1e9)'"
+        ),
+        config,
+    )
+    if ok and out:
+        lines = [x for x in out.splitlines() if x.strip()]
+        if len(lines) >= 1:
+            status["disk"] = _to_float(lines[0])
+        if len(lines) >= 2:
+            status["disk_free_gb"] = _to_float(lines[1])
     
     ok, out = ssh_exec(name, "uptime -p", config)
     if ok: status["uptime"] = out
@@ -333,10 +359,15 @@ def format_status_message(s, earnings):
     balance_gnk = earnings["balance"] / 1000000000 if earnings["balance"] > 0 else 0
     epoch_earned_gnk = earnings["epoch_earned"] / 1000000000 if earnings["epoch_earned"] > 0 else 0
     
+    cpu_txt = "n/a" if s.get("cpu") is None else f"{s['cpu']:.0f}%"
+    mem_txt = "n/a" if s.get("memory") is None else f"{s['memory']:.0f}%"
+    disk_pct_txt = "n/a" if s.get("disk") is None else f"{s['disk']:.0f}%"
+    disk_free_txt = "n/a" if s.get("disk_free_gb") is None else f"{s['disk_free_gb']:.0f}GB free"
+
     return """<b>{name}</b>
 
 <b>📊 System</b>
-  CPU: {cpu:.0f}% | RAM: {mem:.0f}% | Disk: {disk:.0f}% ({disk_free:.0f}GB free)
+  CPU: {cpu_txt} | RAM: {mem_txt} | Disk: {disk_pct_txt} ({disk_free_txt})
   {uptime}
 
 <b>🖥 GPUs</b>
@@ -361,8 +392,10 @@ def format_status_message(s, earnings):
 <b>🐳 Containers</b>
   {containers_ok}/{containers_total} healthy{unhealthy}""".format(
         name=s["name"],
-        cpu=s["cpu"], mem=s["memory"], disk=s["disk"],
-        disk_free=s.get("disk_free_gb", 0.0),
+        cpu_txt=cpu_txt,
+        mem_txt=mem_txt,
+        disk_pct_txt=disk_pct_txt,
+        disk_free_txt=disk_free_txt,
         uptime=s["uptime"],
         gpu=gpu_text,
         sync_icon=sync_icon,
