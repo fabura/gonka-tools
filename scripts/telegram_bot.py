@@ -25,6 +25,7 @@ WALLET_ADDRESS = os.environ.get("GONKA_WALLET_ADDRESS", "").strip()
 PUBLIC_API = os.environ.get("GONKA_PUBLIC_API", "http://node2.gonka.ai:8000").strip()
 NODES_YAML_PATH = os.environ.get("NODES_YAML_PATH", "./config/nodes.yaml").strip()
 DEFAULT_MODEL_HF_REPO = os.environ.get("DEFAULT_MODEL_HF_REPO", "Qwen/Qwen3-32B-FP8").strip()
+SINGLE_MODEL_MODE = os.environ.get("SINGLE_MODEL_MODE", "1").strip().lower() in ("1", "true", "yes", "y")
 
 
 def load_nodes() -> dict:
@@ -97,6 +98,11 @@ def _to_float(s: str):
         return float(str(s).strip())
     except Exception:
         return None
+
+
+def hf_cache_dir_for_repo(hf_repo: str) -> str:
+    # HuggingFace hub cache naming: models--{org}--{name}
+    return "/mnt/shared/hub/models--" + hf_repo.replace("/", "--")
 
 
 async def fetch_url(url, timeout=10):
@@ -735,6 +741,23 @@ ENVEOF
         
         # Download model
         model_repo = os.environ.get("DEFAULT_MODEL_HF_REPO", "Qwen/Qwen3-32B-FP8")
+
+        # Single-model mode: keep disk stable by removing other model caches.
+        # We do this BEFORE starting a new download to avoid running out of space mid-download.
+        if SINGLE_MODEL_MODE:
+            await send_message(chat_id, f"🧹 Single-model mode: keeping only {model_repo} cache...")
+            keep_dir = hf_cache_dir_for_repo(model_repo)
+            cleanup_cmd = f"""set -e
+rm -rf /mnt/shared/xet/* 2>/dev/null || true
+if [ -d /mnt/shared/hub ]; then
+  for d in /mnt/shared/hub/models--*; do
+    [ \"$d\" = \"{keep_dir}\" ] && continue
+    rm -rf \"$d\" || true
+  done
+fi
+df -h / | tail -1
+"""
+            ssh_exec(ip, cleanup_cmd, config)
         await send_message(chat_id, f"📥 Downloading model ({model_repo})...")
         ok, _ = ssh_exec(ip, """
             curl -s -X POST http://localhost:8080/api/v1/models/download \
