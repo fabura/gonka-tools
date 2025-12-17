@@ -13,7 +13,7 @@ import os
 import subprocess
 import time
 from datetime import datetime
-from typing import List
+from typing import Any, Dict, List
 
 import httpx
 import paramiko
@@ -52,6 +52,17 @@ def load_nodes() -> dict:
 
 
 NODES = load_nodes()
+_NODES_LOCK = asyncio.Lock()
+
+
+def load_nodes_yaml(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def save_nodes_yaml(path: str, data: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
 
 CHECK_INTERVAL = 300
 REPORT_INTERVAL = 1800
@@ -488,6 +499,7 @@ async def handle_update(update):
 /models - Downloaded models
 /epoch_model - Show controller epoch model
 /align - Download + deploy controller epoch model (single-model mode)
+/remove_node &lt;name&gt; - Remove node from servers list (nodes.yaml)
 /logs - Recent logs
 /restart - Restart services
 /pow - PoW/PoC status
@@ -550,6 +562,44 @@ Epochs completed: {}
             else:
                 text = "📦 No models downloaded"
             await send_message(chat_id, text)
+
+    elif cmd.startswith("/remove_node"):
+        parts = text.strip().split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip():
+            await send_message(chat_id, "Usage: /remove_node <name>\nExample: /remove_node neon-galaxy-fin-01")
+            return
+
+        node_name = parts[1].strip()
+        async with _NODES_LOCK:
+            try:
+                data = load_nodes_yaml(NODES_YAML_PATH)
+            except FileNotFoundError:
+                await send_message(chat_id, f"❌ nodes.yaml not found at: {NODES_YAML_PATH}")
+                return
+            except Exception as e:
+                await send_message(chat_id, f"❌ Failed to read nodes.yaml: {str(e)[:120]}")
+                return
+
+            nodes_list = data.get("nodes", []) or []
+            before = len(nodes_list)
+            nodes_list = [n for n in nodes_list if (n or {}).get("name") != node_name]
+            after = len(nodes_list)
+            if before == after:
+                await send_message(chat_id, f"⚠️ Node not found in nodes.yaml: {node_name}")
+                return
+
+            data["nodes"] = nodes_list
+            try:
+                save_nodes_yaml(NODES_YAML_PATH, data)
+            except Exception as e:
+                await send_message(chat_id, f"❌ Failed to write nodes.yaml: {str(e)[:120]}")
+                return
+
+            # Reload in-memory nodes
+            global NODES
+            NODES = load_nodes()
+
+        await send_message(chat_id, f"✅ Removed node: <b>{node_name}</b>\nRemaining: {', '.join(NODES.keys()) if NODES else '(none)'}")
 
     elif cmd == "/epoch_model":
         for name, config in NODES.items():
