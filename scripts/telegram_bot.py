@@ -595,9 +595,9 @@ Epochs completed: {}
                 await send_message(chat_id, f"❌ Failed to write nodes.yaml: {str(e)[:120]}")
                 return
 
-            # Reload in-memory nodes
-            global NODES
-            NODES = load_nodes()
+            # Reload in-memory nodes (in-place so we don't need `global NODES`)
+            NODES.clear()
+            NODES.update(load_nodes())
 
         await send_message(chat_id, f"✅ Removed node: <b>{node_name}</b>\nRemaining: {', '.join(NODES.keys()) if NODES else '(none)'}")
 
