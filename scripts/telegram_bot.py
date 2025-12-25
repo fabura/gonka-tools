@@ -1324,16 +1324,28 @@ df -h / | tail -1
             "🎉 Ready! PoC runs every 24h." if "INFERENCE" in str(mlnode_msg) else "⏳ Starting up... Check /status in a few minutes."
         ))
         
-        # Add to NODES for monitoring
-        await send_message(chat_id, """📌 <b>Add to monitoring:</b>
-To add this node to bot monitoring, update NODES in bot.py:
+        # Add to monitoring
+        node_name = ip.replace(".", "-")
+        await send_message(
+            chat_id,
+            """📌 <b>Add to monitoring:</b>
+Add this node to your <b>nodes.yaml</b> (path: <code>{nodes_yaml}</code>):
 
-<pre>"{}": {{
-    "host": "{}",
-    "port": 22,
-    "user": "root",
-    "key_path": "~/.ssh/gonka_key",
-}}</pre>""".format(server_ip.replace(".", "-"), ip))
+<pre>nodes:
+  - name: {name}
+    host: {host}
+    port: 22
+    user: {user}
+    ssh_key: {ssh_key}</pre>
+
+Tip: you can later remove it with <code>/remove_node {name}</code>.""".format(
+                nodes_yaml=NODES_YAML_PATH,
+                name=node_name,
+                host=ip,
+                user=DEFAULT_SSH_USER,
+                ssh_key=DEFAULT_SSH_KEY_PATH,
+            ),
+        )
     
     elif cmd == "/report":
         await send_report()
