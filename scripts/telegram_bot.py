@@ -152,6 +152,15 @@ def _docker_exec(name: str, cmd: str, config: dict) -> tuple:
     return ok, out
 
 
+def _sudo_shell(cmd: str, config: dict) -> str:
+    """
+    Wrap a shell command so it runs with sudo when needed.
+    Use bash -lc so `cd` and other shell builtins work.
+    """
+    if (config.get("user") or "").strip() == "root":
+        return cmd
+    return "sudo bash -lc " + shlex.quote(cmd)
+
 def _home_dir_for_user(user: str) -> str:
     u = (user or "").strip() or "root"
     return "/root" if u == "root" else f"/home/{u}"
@@ -903,9 +912,11 @@ df -h / | tail -1
             return
         name = list(NODES.keys())[0]
         config = NODES[name]
-        ok, logs = ssh_exec(name,
-            ("sudo " if (config.get("user") or "").strip() != "root" else "") + "cd /opt/gonka/deploy/join && docker compose logs --tail 15 2>&1 | tail -25",
-            config)
+        ok, logs = ssh_exec(
+            name,
+            _sudo_shell("cd /opt/gonka/deploy/join && docker compose logs --tail 15 2>&1 | tail -25", config),
+            config,
+        )
         if ok and logs:
             await send_message(chat_id, "<pre>{}</pre>".format(logs[-3500:]))
         else:
@@ -918,9 +929,11 @@ df -h / | tail -1
         name = list(NODES.keys())[0]
         config = NODES[name]
         await send_message(chat_id, "🔄 Restarting...")
-        ok, _ = ssh_exec(name,
-            ("sudo " if (config.get("user") or "").strip() != "root" else "") + "cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart 2>&1",
-            config)
+        ok, _ = ssh_exec(
+            name,
+            _sudo_shell("cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart 2>&1", config),
+            config,
+        )
         await send_message(chat_id, "✅ Restart initiated" if ok else "❌ Failed")
     
     elif cmd == "/pow":
