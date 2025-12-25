@@ -989,12 +989,14 @@ df -h / | tail -1
         
         # Run installation
         await send_message(chat_id, "📦 Step 1/5: Installing dependencies...")
+        # Avoid installing Ubuntu's docker.io here because some images already ship with Docker CE
+        # (docker-ce/docker-ce-cli/containerd.io) which conflicts with docker.io.
         ok = await _run_remote_step_with_status(
             chat_id,
             ip,
             config,
             "Step 1/5: Installing dependencies",
-            f"{SUDO}apt-get update -qq && {SUDO}apt-get install -y -qq curl wget git jq unzip expect docker.io",
+            f"{SUDO}apt-get update -qq && {SUDO}apt-get install -y -qq curl wget git jq unzip expect ca-certificates gnupg",
             timeout_seconds=1800,
         )
         if not ok:
@@ -1009,6 +1011,17 @@ df -h / | tail -1
             textwrap.dedent(
                 f"""
                 set -e
+                # Install Docker if missing. Prefer Docker CE if the docker repo is configured; otherwise use docker.io.
+                if ! command -v docker >/dev/null 2>&1; then
+                  if apt-cache policy docker-ce 2>/dev/null | grep -q 'Candidate: (none)'; then
+                    {SUDO}apt-get update -qq
+                    {SUDO}apt-get install -y -qq docker.io
+                  else
+                    {SUDO}apt-get update -qq
+                    {SUDO}apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                  fi
+                fi
+
                 {SUDO}systemctl enable docker
                 {SUDO}systemctl start docker
                 if lspci | grep -i nvidia > /dev/null; then
