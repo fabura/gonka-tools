@@ -8,10 +8,14 @@ Security:
 """
 
 import asyncio
+import html
 import json
 import os
+import random
+import shlex
 import subprocess
 import time
+import textwrap
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -30,6 +34,11 @@ SINGLE_MODEL_MODE = os.environ.get("SINGLE_MODEL_MODE", "1").strip().lower() in 
 DEFAULT_ACCOUNT_PUBKEY = os.environ.get("DEFAULT_ACCOUNT_PUBKEY", "").strip()
 DEFAULT_SSH_USER = os.environ.get("DEFAULT_SSH_USER", "ubuntu").strip()
 DEFAULT_SSH_KEY_PATH = os.path.expanduser(os.environ.get("DEFAULT_SSH_KEY_PATH", "~/.ssh/gonka_key").strip())
+
+INSTALL_STATUS_UPDATES = os.environ.get("INSTALL_STATUS_UPDATES", "1").strip().lower() in ("1", "true", "yes", "y")
+INSTALL_STATUS_POLL_SECONDS = int(os.environ.get("INSTALL_STATUS_POLL_SECONDS", "15"))
+INSTALL_STATUS_TAIL_LINES = int(os.environ.get("INSTALL_STATUS_TAIL_LINES", "4"))
+INSTALL_STATUS_MIN_MESSAGE_SECONDS = int(os.environ.get("INSTALL_STATUS_MIN_MESSAGE_SECONDS", "30"))
 
 
 def load_nodes() -> dict:
@@ -107,6 +116,89 @@ def sh_quote(cmd: str) -> str:
     safe = cmd.replace("$", "\\$")
     return "bash -lc " + json.dumps(safe)
 
+
+def _html_pre(text: str) -> str:
+    return "<pre>{}</pre>".format(html.escape(text, quote=False))
+
+
+def _sudo_prefix_for_user(user: str) -> str:
+    return "" if (user or "").strip() == "root" else "sudo "
+
+
+def _remote_job_paths(job_id: str) -> tuple:
+    base = f"/tmp/gonka_install_{job_id}"
+    return base + ".log", base + ".exit"
+
+
+def _start_remote_job(host: str, config: dict, job_cmd: str) -> tuple:
+    """Start a long-running command on remote host, returning (ok, log_path, exit_path, err)."""
+    job_id = "{}-{}".format(int(time.time()), random.randint(1000, 9999))
+    log_path, exit_path = _remote_job_paths(job_id)
+
+    # Run in background, write full output to log, and write exit code to exit file at the end.
+    script = f"""
+set -e
+LOG={shlex.quote(log_path)}
+EXIT={shlex.quote(exit_path)}
+rm -f "$LOG" "$EXIT"
+( nohup bash -lc {shlex.quote(job_cmd)} >"$LOG" 2>&1; echo $? >"$EXIT" ) >/dev/null 2>&1 &
+echo "$LOG"
+"""
+    ok, out = ssh_exec(host, textwrap.dedent(script).strip(), config)
+    if not ok:
+        return False, "", "", out
+    return True, log_path, exit_path, ""
+
+
+async def _run_remote_step_with_status(chat_id: int, host: str, config: dict, title: str, job_cmd: str, timeout_seconds: int = 3600) -> bool:
+    """Run remote command with periodic status messages (tailing last N log lines)."""
+    if not INSTALL_STATUS_UPDATES:
+        ok, out = ssh_exec(host, job_cmd, config)
+        if not ok:
+            await send_message(chat_id, f"❌ {title}\n{_html_pre(out[:1200])}")
+            return False
+        return True
+
+    ok, log_path, exit_path, err = _start_remote_job(host, config, job_cmd)
+    if not ok:
+        await send_message(chat_id, f"❌ Failed to start: {title}\n{_html_pre(err[:1200])}")
+        return False
+
+    start = time.time()
+    last_sent = 0.0
+    last_tail = ""
+
+    while True:
+        if time.time() - start > timeout_seconds:
+            await send_message(chat_id, f"❌ Timeout: {title} (> {timeout_seconds}s)\nLog: {log_path}")
+            return False
+
+        ok1, exit_out = ssh_exec(host, f"test -f {shlex.quote(exit_path)} && cat {shlex.quote(exit_path)} || echo RUNNING", config)
+        ok2, tail_out = ssh_exec(host, f"tail -n {INSTALL_STATUS_TAIL_LINES} {shlex.quote(log_path)} 2>/dev/null || true", config)
+        if not ok1:
+            exit_out = "RUNNING"
+        if not ok2:
+            tail_out = ""
+
+        tail_out = (tail_out or "").strip()
+        should_send = tail_out and tail_out != last_tail and (time.time() - last_sent) >= INSTALL_STATUS_MIN_MESSAGE_SECONDS
+        if should_send:
+            await send_message(chat_id, f"⏳ {title} (still running)\n{_html_pre(tail_out[-1500:])}")
+            last_sent = time.time()
+            last_tail = tail_out
+
+        if "RUNNING" not in str(exit_out):
+            code = str(exit_out).strip()
+            ok_code = code == "0"
+            final_tail = tail_out
+            status = "✅" if ok_code else "❌"
+            msg = f"{status} {title} (exit={code})"
+            if final_tail:
+                msg += "\n" + _html_pre(final_tail[-3000:])
+            await send_message(chat_id, msg)
+            return ok_code
+
+        await asyncio.sleep(max(5, INSTALL_STATUS_POLL_SECONDS))
 
 def _to_float(s: str):
     try:
@@ -854,6 +946,7 @@ df -h / | tail -1
         await send_message(chat_id, "🚀 Starting Gonka installation on {} (user: {})...\nThis will take 10-15 minutes.".format(ip, DEFAULT_SSH_USER))
         
         config = {"host": ip, "port": 22, "user": DEFAULT_SSH_USER, "key_path": DEFAULT_SSH_KEY_PATH}
+        SUDO = _sudo_prefix_for_user(config.get("user", ""))
         
         # Check connectivity first
         ok, _ = ssh_exec(ip, "echo ok", config)
@@ -863,47 +956,87 @@ df -h / | tail -1
         
         # Run installation
         await send_message(chat_id, "📦 Step 1/5: Installing dependencies...")
-        ok, out = ssh_exec(ip, "apt-get update -qq && apt-get install -y -qq curl wget git jq unzip expect docker.io", config)
+        ok = await _run_remote_step_with_status(
+            chat_id,
+            ip,
+            config,
+            "Step 1/5: Installing dependencies",
+            f"{SUDO}apt-get update -qq && {SUDO}apt-get install -y -qq curl wget git jq unzip expect docker.io",
+            timeout_seconds=1800,
+        )
         if not ok:
-            await send_message(chat_id, "❌ Failed to install dependencies")
             return
         
         await send_message(chat_id, "🐳 Step 2/5: Setting up Docker & NVIDIA...")
-        ok, _ = ssh_exec(ip, """
-            systemctl enable docker && systemctl start docker
-            if lspci | grep -i nvidia > /dev/null; then
-                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
-                curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-                apt-get update -qq && apt-get install -y -qq nvidia-container-toolkit
-                nvidia-ctk runtime configure --runtime=docker
-                systemctl restart docker
-            fi
-        """, config)
+        ok = await _run_remote_step_with_status(
+            chat_id,
+            ip,
+            config,
+            "Step 2/5: Setting up Docker & NVIDIA",
+            textwrap.dedent(
+                f"""
+                set -e
+                {SUDO}systemctl enable docker
+                {SUDO}systemctl start docker
+                if lspci | grep -i nvidia > /dev/null; then
+                    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | {SUDO}gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
+                    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | {SUDO}tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+                    {SUDO}apt-get update -qq
+                    {SUDO}apt-get install -y -qq nvidia-container-toolkit
+                    {SUDO}nvidia-ctk runtime configure --runtime=docker
+                    {SUDO}systemctl restart docker
+                fi
+                """
+            ).strip(),
+            timeout_seconds=1800,
+        )
+        if not ok:
+            return
         
         await send_message(chat_id, "📥 Step 3/5: Cloning Gonka repository...")
-        ok, _ = ssh_exec(ip, """
-            rm -rf /opt/gonka
-            git clone https://github.com/gonka-ai/gonka.git -b main /opt/gonka --quiet
-            mkdir -p /mnt/shared
-            mkdir -p /root/.inference/keyring-file
-        """, config)
+        ok = await _run_remote_step_with_status(
+            chat_id,
+            ip,
+            config,
+            "Step 3/5: Cloning Gonka repository",
+            textwrap.dedent(
+                f"""
+                set -e
+                {SUDO}rm -rf /opt/gonka
+                {SUDO}git clone https://github.com/gonka-ai/gonka.git -b main /opt/gonka --quiet
+                {SUDO}mkdir -p /mnt/shared
+                {SUDO}mkdir -p /root/.inference/keyring-file
+                """
+            ).strip(),
+            timeout_seconds=1800,
+        )
+        if not ok:
+            return
         
         await send_message(chat_id, "🔐 Step 4/5: Creating ML Ops key...")
         # Create ML ops key
-        ok, key_output = ssh_exec(ip, """
-            cd /opt/gonka/deploy/join
-            expect << 'EOF'
-spawn inferenced keys add ml-ops-key --keyring-backend file
-expect "passphrase"
-send "gonkapass\\r"
-expect "passphrase"
-send "gonkapass\\r"
-expect eof
-EOF
-            sleep 2
-            echo "---KEY_INFO---"
-            echo "gonkapass" | inferenced keys show ml-ops-key --keyring-backend file 2>/dev/null
-        """, config)
+        # Step 4 is interactive-ish (expect), keep the final output for parsing.
+        ok, key_output = ssh_exec(
+            ip,
+            textwrap.dedent(
+                f"""
+                set -e
+                cd /opt/gonka/deploy/join
+                expect << 'EOF'
+                spawn inferenced keys add ml-ops-key --keyring-backend file
+                expect "passphrase"
+                send "gonkapass\\r"
+                expect "passphrase"
+                send "gonkapass\\r"
+                expect eof
+                EOF
+                sleep 2
+                echo "---KEY_INFO---"
+                echo "gonkapass" | inferenced keys show ml-ops-key --keyring-backend file 2>/dev/null
+                """
+            ).strip(),
+            config,
+        )
         
         # Parse ML ops address
         ml_ops_address = ""
@@ -915,39 +1048,51 @@ EOF
         
         await send_message(chat_id, "⚙️ Step 5/5: Configuring and starting services...")
         # Create config and start
-        ok, _ = ssh_exec(ip, """
-            cd /opt/gonka/deploy/join
-            SERVER_IP=$(curl -s ifconfig.me)
-            
-            cat > .env << ENVEOF
-KEY_NAME=ml-ops-key
-KEYRING_PASSWORD=gonkapass
-KEYRING_BACKEND=file
-API_PORT=8000
-API_SSL_PORT=8443
-PUBLIC_URL=http://${{SERVER_IP}}:8000
-P2P_EXTERNAL_ADDRESS=tcp://${{SERVER_IP}}:5000
-ACCOUNT_PUBKEY={pubkey}
-NODE_CONFIG=./node-config.json
-HF_HOME=/mnt/shared
-SEED_API_URL=http://node2.gonka.ai:8000
-SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
-SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
-DAPI_API__POC_CALLBACK_URL=http://api:9100
-DAPI_CHAIN_NODE__URL=http://node:26657
-DAPI_CHAIN_NODE__P2P_URL=http://node:26656
-RPC_SERVER_URL_1=http://node1.gonka.ai:26657
-RPC_SERVER_URL_2=http://node2.gonka.ai:26657
-PORT=8080
-INFERENCE_PORT=5050
-ENVEOF
-            
-            mkdir -p .inference/keyring-file
-            cp -r /root/.inference/keyring-file/* .inference/keyring-file/ 2>/dev/null || true
-            
-            docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull 2>&1 | tail -3
-            docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d 2>&1 | tail -5
-        """.format(pubkey=pubkey), config)
+        ok = await _run_remote_step_with_status(
+            chat_id,
+            ip,
+            config,
+            "Step 5/5: Configuring and starting services",
+            textwrap.dedent(
+                f"""
+                set -e
+                cd /opt/gonka/deploy/join
+                SERVER_IP=$(curl -s ifconfig.me)
+
+                cat > .env << ENVEOF
+                KEY_NAME=ml-ops-key
+                KEYRING_PASSWORD=gonkapass
+                KEYRING_BACKEND=file
+                API_PORT=8000
+                API_SSL_PORT=8443
+                PUBLIC_URL=http://${{SERVER_IP}}:8000
+                P2P_EXTERNAL_ADDRESS=tcp://${{SERVER_IP}}:5000
+                ACCOUNT_PUBKEY={pubkey}
+                NODE_CONFIG=./node-config.json
+                HF_HOME=/mnt/shared
+                SEED_API_URL=http://node2.gonka.ai:8000
+                SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
+                SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
+                DAPI_API__POC_CALLBACK_URL=http://api:9100
+                DAPI_CHAIN_NODE__URL=http://node:26657
+                DAPI_CHAIN_NODE__P2P_URL=http://node:26656
+                RPC_SERVER_URL_1=http://node1.gonka.ai:26657
+                RPC_SERVER_URL_2=http://node2.gonka.ai:26657
+                PORT=8080
+                INFERENCE_PORT=5050
+                ENVEOF
+
+                {SUDO}mkdir -p .inference/keyring-file
+                {SUDO}cp -r /root/.inference/keyring-file/* .inference/keyring-file/ 2>/dev/null || true
+
+                docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull
+                docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d
+                """
+            ).strip(),
+            timeout_seconds=2400,
+        )
+        if not ok:
+            return
         
         # Wait a bit and check status
         await send_message(chat_id, "⏳ Waiting for services to start (90s)...")
