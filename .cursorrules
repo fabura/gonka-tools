@@ -1,0 +1,48 @@
+You are an AI coding agent working in the `gonka-tools` repository.
+Goal: help operate and automate Gonka.ai nodes (install, monitor, deploy inference models, keep disk stable) and keep the public repo free of secrets.
+
+## Hard rules (security + repo hygiene)
+- Never hardcode or print secrets (Telegram tokens, chat IDs, wallet seeds, private keys, SSH hosts/IPs that the user considers private).
+- Public repo must NOT contain private config. Keep sensitive files out of git (use `.gitignore` and `config/*.example` patterns).
+- Prefer config via environment variables and `nodes.yaml`. Any example values should be placeholders.
+- Prefer safe shell quoting and non-interactive flags.
+
+## Project layout + conventions
+- `scripts/telegram_bot.py`: Telegram bot for monitoring + remote management (SSH + MLNode API).
+  - Loads config from environment and `NODES_YAML_PATH` (`nodes.yaml`).
+  - Commands should be robust: if no nodes are configured, respond with a helpful message instead of crashing/silent failure.
+  - Assume remote shell may be `dash`; avoid complex `awk` quoting. Prefer python parsing or simple commands.
+  - Always support Telegram group command form `/cmd@BotName`.
+  - For Docker actions with non-root SSH users, use `sudo bash -lc 'cd ... && docker ...'` (don’t `sudo cd`).
+  - If docker socket is permission-denied, retry with sudo automatically.
+  - When deploying vLLM, compute args from GPU count (don’t hardcode TP=2).
+  - Disk hygiene: “single-model mode” should delete other HF caches and `/mnt/shared/xet` before downloads.
+- `scripts/quick_setup.sh`: install/setup helper for a node.
+  - Must be idempotent where possible.
+  - Include Docker log rotation (`/etc/docker/daemon.json`) to prevent disk fill.
+- `config/env.example`, `config/nodes.yaml.example`: public templates only.
+
+## Operational defaults (what to assume)
+- SSH user may be `ubuntu` (or `root`); when not root, use sudo for privileged operations.
+- Default SSH key path is `~/.ssh/gonka_key` (expand `~`).
+- On new nodes, Docker may already be Docker CE; avoid installing Ubuntu `docker.io` if it conflicts.
+- vLLM failures to expect:
+  - KV cache / max seq len mismatch: fix via `--max-model-len` (e.g. 32768) and `--gpu-memory-utilization`.
+  - Wrong tensor parallel for GPU count: TP must not exceed available GPUs.
+- Chain sync can show block 0 during state-sync snapshot apply; check `docker logs node` for `statesync` progress.
+
+## How to deploy bot changes (typical workflow)
+1. Commit + push in this repo.
+2. On monitoring server:
+   - `cd /opt/gonka-tools && git pull`
+   - `cp -f /opt/gonka-tools/scripts/telegram_bot.py /opt/gonka-monitor/bot.py`
+   - Ensure env file exists at `/opt/gonka-monitor/.env` (systemd `EnvironmentFile=`).
+   - `systemctl restart gonka-monitor`
+   - `journalctl -u gonka-monitor -n 100 --no-pager`
+
+## When responding to user requests
+- Make the smallest safe change that solves the issue, then deploy and verify.
+- Prefer adding commands/features that reduce operational toil (add/remove node, status, align, disk alerts).
+- Keep messages concise and action-oriented.
+
+
