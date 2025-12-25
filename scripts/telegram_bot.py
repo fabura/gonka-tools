@@ -668,6 +668,14 @@ async def handle_update(update):
 <b>Auto:</b> Reports every 30 min""")
     
     elif cmd == "/status":
+        if not NODES:
+            await send_message(
+                chat_id,
+                "⚠️ No nodes configured.\n\nAdd nodes to: <code>{}</code>\n(or use /install, then add the suggested YAML)".format(
+                    NODES_YAML_PATH
+                ),
+            )
+            return
         await send_message(chat_id, "🔍 Getting status...")
         earnings = await get_earnings_info()
         for name, config in NODES.items():
@@ -675,6 +683,9 @@ async def handle_update(update):
             await send_message(chat_id, format_status_message(status, earnings))
     
     elif cmd == "/quick":
+        if not NODES:
+            await send_message(chat_id, "⚠️ No nodes configured. Add nodes to: <code>{}</code>".format(NODES_YAML_PATH))
+            return
         earnings = await get_earnings_info()
         for name, config in NODES.items():
             s = get_full_status(name, config)
@@ -786,6 +797,9 @@ Epochs completed: {}
 
     elif cmd == "/align":
         # Align to controller epoch model: cleanup (single-model), download, deploy, verify.
+        if not NODES:
+            await send_message(chat_id, "⚠️ No nodes configured. Add nodes to: <code>{}</code>".format(NODES_YAML_PATH))
+            return
         target_name = list(NODES.keys())[0]
         target = NODES[target_name]
 
@@ -881,6 +895,9 @@ df -h / | tail -1
         await send_message(chat_id, f"✅ Align complete.\n<pre>{state_out[-2000:] if state_out else ''}</pre>")
     
     elif cmd == "/logs":
+        if not NODES:
+            await send_message(chat_id, "⚠️ No nodes configured. Add nodes to: <code>{}</code>".format(NODES_YAML_PATH))
+            return
         name = list(NODES.keys())[0]
         config = NODES[name]
         ok, logs = ssh_exec(name,
@@ -892,6 +909,9 @@ df -h / | tail -1
             await send_message(chat_id, "❌ Failed to get logs")
     
     elif cmd == "/restart":
+        if not NODES:
+            await send_message(chat_id, "⚠️ No nodes configured. Add nodes to: <code>{}</code>".format(NODES_YAML_PATH))
+            return
         name = list(NODES.keys())[0]
         config = NODES[name]
         await send_message(chat_id, "🔄 Restarting...")
