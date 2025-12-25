@@ -1222,8 +1222,10 @@ async def main():
 
     if not BOT_TOKEN or not ALLOWED_CHAT_ID:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in environment")
+    # Allow starting even with an empty nodes.yaml so the bot can still be used for
+    # /install, /check, and other non-monitoring commands.
     if not NODES:
-        raise SystemExit(f"No nodes loaded. Set NODES_YAML_PATH (currently: {NODES_YAML_PATH})")
+        print(f"No nodes loaded. Monitoring disabled until NODES_YAML_PATH has nodes (currently: {NODES_YAML_PATH})")
     
     await send_message(ALLOWED_CHAT_ID, """🤖 <b>Gonka Bot v3 Online!</b>
 
