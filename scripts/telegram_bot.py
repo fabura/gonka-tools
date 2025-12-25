@@ -27,6 +27,9 @@ PUBLIC_API = os.environ.get("GONKA_PUBLIC_API", "http://node2.gonka.ai:8000").st
 NODES_YAML_PATH = os.environ.get("NODES_YAML_PATH", "./config/nodes.yaml").strip()
 DEFAULT_MODEL_HF_REPO = os.environ.get("DEFAULT_MODEL_HF_REPO", "Qwen/Qwen3-32B-FP8").strip()
 SINGLE_MODEL_MODE = os.environ.get("SINGLE_MODEL_MODE", "1").strip().lower() in ("1", "true", "yes", "y")
+DEFAULT_ACCOUNT_PUBKEY = os.environ.get("DEFAULT_ACCOUNT_PUBKEY", "").strip()
+DEFAULT_SSH_USER = os.environ.get("DEFAULT_SSH_USER", "ubuntu").strip()
+DEFAULT_SSH_KEY_PATH = os.environ.get("DEFAULT_SSH_KEY_PATH", "/root/.ssh/gonka_key").strip()
 
 
 def load_nodes() -> dict:
@@ -506,8 +509,8 @@ async def handle_update(update):
 /report - Send full report
 
 <b>Setup:</b>
-/install &lt;ip&gt; &lt;pubkey&gt; - Install node on new server
-/check &lt;ip&gt; - Check server before install
+/install &lt;ip&gt; [pubkey] - Install node on new server
+/check &lt;ip&gt; - Check server before install (uses DEFAULT_SSH_USER)
 
 <b>Auto:</b> Reports every 30 min""")
     
@@ -793,9 +796,9 @@ df -h / | tail -1
             return
         
         ip = parts[1]
-        await send_message(chat_id, "🔍 Checking server {}...".format(ip))
+        await send_message(chat_id, "🔍 Checking server {} (user: {})...".format(ip, DEFAULT_SSH_USER))
         
-        config = {"host": ip, "port": 22, "user": "root", "key_path": "/root/.ssh/gonka_key"}
+        config = {"host": ip, "port": 22, "user": DEFAULT_SSH_USER, "key_path": DEFAULT_SSH_KEY_PATH}
         
         # Check connectivity
         ok, out = ssh_exec(ip, "echo ok", config)
@@ -830,16 +833,20 @@ df -h / | tail -1
     elif text.lower().startswith("/install "):
         # Install Gonka on a new server
         parts = text.strip().split()
-        if len(parts) < 3:
-            await send_message(chat_id, "Usage: /install <ip> <account_pubkey>\n\nExample:\n/install 65.108.33.117 AxIZzsbyk90lA...")
+        if len(parts) < 2:
+            await send_message(chat_id, "Usage: /install <ip> [pubkey]\n\nExample:\n/install 65.108.33.117\n/install 65.108.33.117 AxIZzsbyk90lA...")
             return
         
         ip = parts[1]
-        pubkey = parts[2]
+        pubkey = parts[2] if len(parts) >= 3 else DEFAULT_ACCOUNT_PUBKEY
         
-        await send_message(chat_id, "🚀 Starting Gonka installation on {}...\nThis will take 10-15 minutes.".format(ip))
+        if not pubkey:
+            await send_message(chat_id, "❌ No pubkey provided and DEFAULT_ACCOUNT_PUBKEY not set in environment.\n\nUsage: /install <ip> <pubkey>")
+            return
         
-        config = {"host": ip, "port": 22, "user": "root", "key_path": "/root/.ssh/gonka_key"}
+        await send_message(chat_id, "🚀 Starting Gonka installation on {} (user: {})...\nThis will take 10-15 minutes.".format(ip, DEFAULT_SSH_USER))
+        
+        config = {"host": ip, "port": 22, "user": DEFAULT_SSH_USER, "key_path": DEFAULT_SSH_KEY_PATH}
         
         # Check connectivity first
         ok, _ = ssh_exec(ip, "echo ok", config)
