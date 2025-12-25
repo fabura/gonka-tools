@@ -14,6 +14,7 @@ import os
 import random
 import shlex
 import subprocess
+import sys
 import time
 import textwrap
 from datetime import datetime
@@ -272,7 +273,7 @@ async def send_message(chat_id, text):
                 timeout=10,
             )
     except Exception as e:
-        print("Send error: {}".format(e))
+        print("Send error: {}".format(e), flush=True)
 
 
 def get_full_status(name, config):
@@ -596,7 +597,7 @@ async def handle_update(update):
 
     if DEBUG_UPDATES:
         try:
-            print("[update] chat_id={} type={} text={!r}".format(chat_id, chat.get("type"), text))
+            print("[update] chat_id={} type={} text={!r}".format(chat_id, chat.get("type"), text), flush=True)
         except Exception:
             pass
 
@@ -1374,7 +1375,7 @@ async def poll_updates():
                     offset = update["update_id"] + 1
                     await handle_update(update)
             except Exception as e:
-                print("Poll error: {}".format(e))
+                print("Poll error: {}".format(e), flush=True)
                 await asyncio.sleep(5)
 
 
@@ -1390,7 +1391,7 @@ async def periodic_tasks():
         try:
             await check_alerts()
         except Exception as e:
-            print("Alert error: {}".format(e))
+            print("Alert error: {}".format(e), flush=True)
         
         # Send report every 30 min
         if now - _last_report >= REPORT_INTERVAL:
@@ -1398,18 +1399,26 @@ async def periodic_tasks():
                 await send_report()
                 _last_report = now
             except Exception as e:
-                print("Report error: {}".format(e))
+                print("Report error: {}".format(e), flush=True)
 
 
 async def main():
-    print("Gonka Bot v3 started at {}".format(datetime.now()))
+    # Force unbuffered-ish output so journald shows logs immediately.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    print("Gonka Bot v3 started at {}".format(datetime.now()), flush=True)
 
     if not BOT_TOKEN or not ALLOWED_CHAT_ID:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in environment")
     # Allow starting even with an empty nodes.yaml so the bot can still be used for
     # /install, /check, and other non-monitoring commands.
     if not NODES:
-        print(f"No nodes loaded. Monitoring disabled until NODES_YAML_PATH has nodes (currently: {NODES_YAML_PATH})")
+        print(
+            f"No nodes loaded. Monitoring disabled until NODES_YAML_PATH has nodes (currently: {NODES_YAML_PATH})",
+            flush=True,
+        )
     
     await send_message(ALLOWED_CHAT_ID, """🤖 <b>Gonka Bot v3 Online!</b>
 
