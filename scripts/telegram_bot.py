@@ -133,6 +133,11 @@ def _sudo_prefix_for_user(user: str) -> str:
     return "" if (user or "").strip() == "root" else "sudo "
 
 
+def _home_dir_for_user(user: str) -> str:
+    u = (user or "").strip() or "root"
+    return "/root" if u == "root" else f"/home/{u}"
+
+
 def _remote_job_paths(job_id: str) -> tuple:
     base = f"/tmp/gonka_install_{job_id}"
     return base + ".log", base + ".exit"
@@ -980,6 +985,7 @@ df -h / | tail -1
         
         config = {"host": ip, "port": 22, "user": DEFAULT_SSH_USER, "key_path": DEFAULT_SSH_KEY_PATH}
         SUDO = _sudo_prefix_for_user(config.get("user", ""))
+        HOME_DIR = _home_dir_for_user(config.get("user", ""))
         
         # Check connectivity first
         ok, _ = ssh_exec(ip, "echo ok", config)
@@ -1054,7 +1060,8 @@ df -h / | tail -1
                 {SUDO}rm -rf /opt/gonka
                 {SUDO}git clone https://github.com/gonka-ai/gonka.git -b main /opt/gonka --quiet
                 {SUDO}mkdir -p /mnt/shared
-                {SUDO}mkdir -p /root/.inference/keyring-file
+                {SUDO}mkdir -p {HOME_DIR}/.inference/keyring-file
+                {SUDO}chown -R {config.get("user","root")}:{config.get("user","root")} {HOME_DIR}/.inference 2>/dev/null || true
                 """
             ).strip(),
             timeout_seconds=1800,
@@ -1108,34 +1115,38 @@ df -h / | tail -1
                 cd /opt/gonka/deploy/join
                 SERVER_IP=$(curl -s ifconfig.me)
 
-                cat > .env << ENVEOF
-                KEY_NAME=ml-ops-key
-                KEYRING_PASSWORD=gonkapass
-                KEYRING_BACKEND=file
-                API_PORT=8000
-                API_SSL_PORT=8443
-                PUBLIC_URL=http://${{SERVER_IP}}:8000
-                P2P_EXTERNAL_ADDRESS=tcp://${{SERVER_IP}}:5000
-                ACCOUNT_PUBKEY={pubkey}
-                NODE_CONFIG=./node-config.json
-                HF_HOME=/mnt/shared
-                SEED_API_URL=http://node2.gonka.ai:8000
-                SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
-                SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
-                DAPI_API__POC_CALLBACK_URL=http://api:9100
-                DAPI_CHAIN_NODE__URL=http://node:26657
-                DAPI_CHAIN_NODE__P2P_URL=http://node:26656
-                RPC_SERVER_URL_1=http://node1.gonka.ai:26657
-                RPC_SERVER_URL_2=http://node2.gonka.ai:26657
-                PORT=8080
-                INFERENCE_PORT=5050
-                ENVEOF
+                # /opt/gonka is typically root-owned; write env via sudo to avoid permission denied.
+                {{
+                  cat <<ENVEOF
+KEY_NAME=ml-ops-key
+KEYRING_PASSWORD=gonkapass
+KEYRING_BACKEND=file
+API_PORT=8000
+API_SSL_PORT=8443
+PUBLIC_URL=http://${{SERVER_IP}}:8000
+P2P_EXTERNAL_ADDRESS=tcp://${{SERVER_IP}}:5000
+ACCOUNT_PUBKEY={pubkey}
+NODE_CONFIG=./node-config.json
+HF_HOME=/mnt/shared
+SEED_API_URL=http://node2.gonka.ai:8000
+SEED_NODE_RPC_URL=http://node2.gonka.ai:26657
+SEED_NODE_P2P_URL=tcp://node2.gonka.ai:5000
+DAPI_API__POC_CALLBACK_URL=http://api:9100
+DAPI_CHAIN_NODE__URL=http://node:26657
+DAPI_CHAIN_NODE__P2P_URL=http://node:26656
+RPC_SERVER_URL_1=http://node1.gonka.ai:26657
+RPC_SERVER_URL_2=http://node2.gonka.ai:26657
+PORT=8080
+INFERENCE_PORT=5050
+ENVEOF
+                }} | {SUDO}tee /opt/gonka/deploy/join/.env >/dev/null
 
-                {SUDO}mkdir -p .inference/keyring-file
-                {SUDO}cp -r /root/.inference/keyring-file/* .inference/keyring-file/ 2>/dev/null || true
+                {SUDO}mkdir -p /opt/gonka/deploy/join/.inference/keyring-file
+                # Copy keyring from the installing user home (root vs ubuntu differ)
+                {SUDO}cp -r {HOME_DIR}/.inference/keyring-file/* /opt/gonka/deploy/join/.inference/keyring-file/ 2>/dev/null || true
 
-                docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull
-                docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d
+                {SUDO}docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull
+                {SUDO}docker compose -f docker-compose.yml -f docker-compose.mlnode.yml up -d
                 """
             ).strip(),
             timeout_seconds=2400,
