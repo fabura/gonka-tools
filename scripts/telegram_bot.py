@@ -29,7 +29,7 @@ DEFAULT_MODEL_HF_REPO = os.environ.get("DEFAULT_MODEL_HF_REPO", "Qwen/Qwen3-32B-
 SINGLE_MODEL_MODE = os.environ.get("SINGLE_MODEL_MODE", "1").strip().lower() in ("1", "true", "yes", "y")
 DEFAULT_ACCOUNT_PUBKEY = os.environ.get("DEFAULT_ACCOUNT_PUBKEY", "").strip()
 DEFAULT_SSH_USER = os.environ.get("DEFAULT_SSH_USER", "ubuntu").strip()
-DEFAULT_SSH_KEY_PATH = os.environ.get("DEFAULT_SSH_KEY_PATH", "/root/.ssh/gonka_key").strip()
+DEFAULT_SSH_KEY_PATH = os.path.expanduser(os.environ.get("DEFAULT_SSH_KEY_PATH", "~/.ssh/gonka_key").strip())
 
 
 def load_nodes() -> dict:
@@ -1127,7 +1127,7 @@ To add this node to bot monitoring, update NODES in bot.py:
     "host": "{}",
     "port": 22,
     "user": "root",
-    "key_path": "/root/.ssh/gonka_key",
+    "key_path": "~/.ssh/gonka_key",
 }}</pre>""".format(server_ip.replace(".", "-"), ip))
     
     elif cmd == "/report":
