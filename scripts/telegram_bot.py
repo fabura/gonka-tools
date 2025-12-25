@@ -483,12 +483,19 @@ async def handle_update(update):
     
     msg = update["message"]
     chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "")
+    text = msg.get("text", "") or ""
     
     if chat_id != ALLOWED_CHAT_ID:
         await send_message(chat_id, "⛔ Unauthorized")
         return
     
+    # Telegram group chats often send commands as /cmd@BotUserName.
+    # Normalize by stripping the @suffix from the first token so commands work in groups too.
+    raw_text = text.strip()
+    parts = raw_text.split()
+    if parts and parts[0].startswith("/"):
+        parts[0] = parts[0].split("@", 1)[0]
+    text = " ".join(parts) if parts else raw_text
     cmd = text.lower().strip()
     
     if cmd == "/start" or cmd == "/help":
