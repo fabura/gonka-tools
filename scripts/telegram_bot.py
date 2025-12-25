@@ -8,6 +8,7 @@ Security:
 """
 
 import asyncio
+import concurrent.futures
 import html
 import json
 import os
@@ -18,6 +19,7 @@ import sys
 import time
 import textwrap
 from datetime import datetime
+from functools import partial
 from typing import Any, Dict, List
 
 import httpx
@@ -94,6 +96,15 @@ DISK_FREE_GB_ALERT_THRESHOLD = float(os.environ.get("DISK_FREE_GB_ALERT_THRESHOL
 
 _last_alerts = {}
 _last_report = 0
+
+# Thread pool for blocking operations (SSH, subprocess)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+async def run_blocking(func, *args, **kwargs):
+    """Run a blocking function in a thread pool to avoid blocking the async event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, partial(func, *args, **kwargs))
 
 
 def ssh_exec(host, cmd, config):
@@ -299,14 +310,19 @@ async def get_network_participant():
 
 async def send_message(chat_id, text):
     try:
+        # Telegram has a 4096 character limit
+        if len(text) > 4000:
+            text = text[:4000] + "... (truncated)"
         async with httpx.AsyncClient() as client:
-            await client.post(
+            resp = await client.post(
                 "https://api.telegram.org/bot{}/sendMessage".format(BOT_TOKEN),
                 json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=10,
+                timeout=30,
             )
+            if resp.status_code != 200:
+                print("Send error: HTTP {} - {}".format(resp.status_code, resp.text[:500]), flush=True)
     except Exception as e:
-        print("Send error: {}".format(e), flush=True)
+        print("Send error: {} - {}".format(type(e).__name__, e), flush=True)
 
 
 def get_full_status(name, config):
@@ -604,7 +620,7 @@ async def send_report():
     earnings = await get_earnings_info()
     
     for name, config in NODES.items():
-        status = get_full_status(name, config)
+        status = await run_blocking(get_full_status, name, config)
         msg = format_status_message(status, earnings)
         msg += "\n\n📅 {}".format(datetime.now().strftime("%Y-%m-%d %H:%M"))
         await send_message(ALLOWED_CHAT_ID, msg)
@@ -691,7 +707,8 @@ async def handle_update(update):
         await send_message(chat_id, "🔍 Getting status...")
         earnings = await get_earnings_info()
         for name, config in NODES.items():
-            status = get_full_status(name, config)
+            # Run blocking SSH calls in thread pool to avoid blocking async loop
+            status = await run_blocking(get_full_status, name, config)
             await send_message(chat_id, format_status_message(status, earnings))
     
     elif cmd == "/quick":
@@ -700,7 +717,7 @@ async def handle_update(update):
             return
         earnings = await get_earnings_info()
         for name, config in NODES.items():
-            s = get_full_status(name, config)
+            s = await run_blocking(get_full_status, name, config)
             if not s["reachable"]:
                 await send_message(chat_id, "❌ {} offline".format(name))
             else:
@@ -728,14 +745,14 @@ Epochs completed: {}
     
     elif cmd == "/sync":
         for name, config in NODES.items():
-            s = get_full_status(name, config)
+            s = await run_blocking(get_full_status, name, config)
             icon = "✅" if s["synced"] else "🔄"
             await send_message(chat_id, "{} Block: {}\nSynced: {}".format(
                 icon, s["sync_block"], "Yes" if s["synced"] else "No"))
     
     elif cmd == "/models":
         for name, config in NODES.items():
-            s = get_full_status(name, config)
+            s = await run_blocking(get_full_status, name, config)
             if s["models"]:
                 text = "📦 <b>Models</b>\n\n" + "\n".join(["✅ {}".format(m) for m in s["models"]])
             else:
@@ -938,7 +955,7 @@ df -h / | tail -1
     
     elif cmd == "/pow":
         for name, config in NODES.items():
-            p = get_pow_status(name, config)
+            p = await run_blocking(get_pow_status, name, config)
             if not p["reachable"]:
                 await send_message(chat_id, "❌ {} offline".format(name))
                 continue
@@ -1415,7 +1432,7 @@ async def check_alerts():
     now = time.time()
     
     for name, config in NODES.items():
-        s = get_full_status(name, config)
+        s = await run_blocking(get_full_status, name, config)
         
         # Offline alert
         if not s["reachable"]:
