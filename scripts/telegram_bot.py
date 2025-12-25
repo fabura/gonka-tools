@@ -1025,7 +1025,10 @@ df -h / | tail -1
                 {SUDO}systemctl enable docker
                 {SUDO}systemctl start docker
                 if lspci | grep -i nvidia > /dev/null; then
-                    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | {SUDO}gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
+                    # Avoid `curl | sudo gpg -o file` because failures in the consumer can surface as
+                    # `curl: (23) Failed writing body`. Instead, write via sudo tee.
+                    set -o pipefail
+                    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor | {SUDO}tee /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg >/dev/null
                     curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | {SUDO}tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
                     {SUDO}apt-get update -qq
                     {SUDO}apt-get install -y -qq nvidia-container-toolkit
