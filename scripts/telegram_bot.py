@@ -132,6 +132,22 @@ def _html_pre(text: str) -> str:
 def _sudo_prefix_for_user(user: str) -> str:
     return "" if (user or "").strip() == "root" else "sudo "
 
+def _docker_exec(name: str, cmd: str, config: dict) -> tuple:
+    """
+    Run a docker command. If the user isn't root and docker socket access is denied,
+    retry via sudo.
+    """
+    ok, out = ssh_exec(name, cmd, config)
+    if ok and out and "permission denied" not in out.lower():
+        return ok, out
+    if (config.get("user") or "").strip() != "root" and (
+        (out and "permission denied" in out.lower())
+        or (out and "docker daemon socket" in out.lower())
+        or (not ok and out and "permission denied" in out.lower())
+    ):
+        return ssh_exec(name, "sudo " + cmd, config)
+    return ok, out
+
 
 def _home_dir_for_user(user: str) -> str:
     u = (user or "").strip() or "root"
@@ -363,7 +379,7 @@ def get_full_status(name, config):
                 except: pass
     
     # Docker
-    ok, out = ssh_exec(name, "docker ps --format '{{.Names}}:{{.Status}}' 2>/dev/null", config)
+    ok, out = _docker_exec(name, "docker ps --format '{{.Names}}:{{.Status}}' 2>/dev/null", config)
     if ok and out:
         for line in out.split("\n"):
             if line:
@@ -868,7 +884,7 @@ df -h / | tail -1
         name = list(NODES.keys())[0]
         config = NODES[name]
         ok, logs = ssh_exec(name,
-            "cd /opt/gonka/deploy/join && docker compose logs --tail 15 2>&1 | tail -25",
+            ("sudo " if (config.get("user") or "").strip() != "root" else "") + "cd /opt/gonka/deploy/join && docker compose logs --tail 15 2>&1 | tail -25",
             config)
         if ok and logs:
             await send_message(chat_id, "<pre>{}</pre>".format(logs[-3500:]))
@@ -880,7 +896,7 @@ df -h / | tail -1
         config = NODES[name]
         await send_message(chat_id, "🔄 Restarting...")
         ok, _ = ssh_exec(name,
-            "cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart 2>&1",
+            ("sudo " if (config.get("user") or "").strip() != "root" else "") + "cd /opt/gonka/deploy/join && docker compose -f docker-compose.yml -f docker-compose.mlnode.yml restart 2>&1",
             config)
         await send_message(chat_id, "✅ Restart initiated" if ok else "❌ Failed")
     
@@ -1192,7 +1208,7 @@ df -h / | tail -1
                 -d '{"hf_repo": "%s"}' 2>/dev/null | jq -r '.status' 2>/dev/null || echo 'UNKNOWN'
         """ % model_repo, config)
         
-        ok, status = ssh_exec(ip, "docker ps --format '{{.Names}}: {{.Status}}' | head -8", config)
+        ok, status = _docker_exec(ip, "docker ps --format '{{.Names}}: {{.Status}}' | head -8", config)
         
         # Get server's public IP
         ok, server_ip = ssh_exec(ip, "curl -s ifconfig.me", config)
@@ -1273,13 +1289,20 @@ df -h / | tail -1
         """, config)
         model_final_msg = model_final if ok and model_final else model_msg
 
-        # Attempt to deploy the model (Qwen3-32B-FP8 requires max-model-len tuning)
+        # Attempt to deploy the model (use known-good args based on GPU count)
         await send_message(chat_id, "🚀 Deploying model (starting vLLM)...")
-        deploy_cmd = f"""curl -sS -X POST http://localhost:8080/api/v1/inference/up \\
-  -H 'Content-Type: application/json' \\
-  -d '{{"model":"{model_repo}","dtype":"float16","additional_args":["--tensor-parallel-size","2","--pipeline-parallel-size","1","--quantization","fp8","--kv-cache-dtype","fp8","--gpu-memory-utilization","0.95","--max-model-len","32768"]}}'"""
+        ok, gpu_count_out = ssh_exec(ip, "nvidia-smi -L 2>/dev/null | wc -l", config)
+        try:
+            gpu_count = int(str(gpu_count_out).strip()) if ok and gpu_count_out else 1
+        except Exception:
+            gpu_count = 1
+        args = pick_inference_args(model_repo, gpu_count)
+        payload = {"model": model_repo, "dtype": "float16", "additional_args": args}
+        deploy_cmd = "curl -sS -X POST http://localhost:8080/api/v1/inference/up -H 'Content-Type: application/json' -d {}".format(
+            shlex.quote(json.dumps(payload))
+        )
         ok, deploy_out = ssh_exec(ip, deploy_cmd, config)
-        deploy_msg = "✅ Deploy started" if ok and ("OK" in deploy_out or "status" in deploy_out) else f"⚠️ Deploy: {deploy_out[:120]}"
+        deploy_msg = "✅ Deploy started" if ok and (deploy_out is None or str(deploy_out).strip() == "" or "OK" in str(deploy_out) or "status" in str(deploy_out)) else f"⚠️ Deploy: {str(deploy_out)[:120]}"
         
         await send_message(chat_id, """✅ <b>Installation Complete!</b>
 
