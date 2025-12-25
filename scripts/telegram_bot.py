@@ -138,12 +138,15 @@ def _docker_exec(name: str, cmd: str, config: dict) -> tuple:
     retry via sudo.
     """
     ok, out = ssh_exec(name, cmd, config)
+    # If stderr is redirected away (some callers use 2>/dev/null), we might get empty output
+    # even when docker fails with "permission denied". In that case, try sudo as well.
     if ok and out and "permission denied" not in out.lower():
         return ok, out
     if (config.get("user") or "").strip() != "root" and (
         (out and "permission denied" in out.lower())
         or (out and "docker daemon socket" in out.lower())
         or (not ok and out and "permission denied" in out.lower())
+        or (ok and (out is None or str(out).strip() == ""))
     ):
         return ssh_exec(name, "sudo " + cmd, config)
     return ok, out
@@ -379,7 +382,7 @@ def get_full_status(name, config):
                 except: pass
     
     # Docker
-    ok, out = _docker_exec(name, "docker ps --format '{{.Names}}:{{.Status}}' 2>/dev/null", config)
+    ok, out = _docker_exec(name, "docker ps --format '{{.Names}}:{{.Status}}'", config)
     if ok and out:
         for line in out.split("\n"):
             if line:
