@@ -26,6 +26,11 @@ import yaml
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
+ALLOWED_CHAT_IDS = [
+    int(x.strip())
+    for x in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",")
+    if x.strip()
+]
 WALLET_ADDRESS = os.environ.get("GONKA_WALLET_ADDRESS", "").strip()
 PUBLIC_API = os.environ.get("GONKA_PUBLIC_API", "http://node2.gonka.ai:8000").strip()
 NODES_YAML_PATH = os.environ.get("NODES_YAML_PATH", "./config/nodes.yaml").strip()
@@ -39,6 +44,8 @@ INSTALL_STATUS_UPDATES = os.environ.get("INSTALL_STATUS_UPDATES", "1").strip().l
 INSTALL_STATUS_POLL_SECONDS = int(os.environ.get("INSTALL_STATUS_POLL_SECONDS", "15"))
 INSTALL_STATUS_TAIL_LINES = int(os.environ.get("INSTALL_STATUS_TAIL_LINES", "4"))
 INSTALL_STATUS_MIN_MESSAGE_SECONDS = int(os.environ.get("INSTALL_STATUS_MIN_MESSAGE_SECONDS", "30"))
+
+DEBUG_UPDATES = os.environ.get("DEBUG_UPDATES", "0").strip().lower() in ("1", "true", "yes", "y")
 
 
 def load_nodes() -> dict:
@@ -574,13 +581,10 @@ async def handle_update(update):
         return
     
     msg = update["message"]
-    chat_id = msg.get("chat", {}).get("id")
+    chat = msg.get("chat", {}) or {}
+    chat_id = chat.get("id")
     text = msg.get("text", "") or ""
-    
-    if chat_id != ALLOWED_CHAT_ID:
-        await send_message(chat_id, "⛔ Unauthorized")
-        return
-    
+
     # Telegram group chats often send commands as /cmd@BotUserName.
     # Normalize by stripping the @suffix from the first token so commands work in groups too.
     raw_text = text.strip()
@@ -589,6 +593,34 @@ async def handle_update(update):
         parts[0] = parts[0].split("@", 1)[0]
     text = " ".join(parts) if parts else raw_text
     cmd = text.lower().strip()
+
+    if DEBUG_UPDATES:
+        try:
+            print("[update] chat_id={} type={} text={!r}".format(chat_id, chat.get("type"), text))
+        except Exception:
+            pass
+
+    # Allow this command from any chat to debug auth issues.
+    if cmd == "/whoami":
+        await send_message(
+            chat_id,
+            "chat_id=<b>{}</b>\nchat_type=<b>{}</b>\n\nSet TELEGRAM_CHAT_ID to this value (or TELEGRAM_ALLOWED_CHAT_IDS).".format(
+                chat_id, chat.get("type")
+            ),
+        )
+        return
+
+    def _is_allowed(cid: int) -> bool:
+        return (cid == ALLOWED_CHAT_ID) or (cid in ALLOWED_CHAT_IDS)
+
+    if not _is_allowed(chat_id):
+        await send_message(
+            chat_id,
+            "⛔ Unauthorized\nchat_id=<b>{}</b>\n\nTo allow this chat, set TELEGRAM_CHAT_ID={} (or add to TELEGRAM_ALLOWED_CHAT_IDS).".format(
+                chat_id, chat_id
+            ),
+        )
+        return
     
     if cmd == "/start" or cmd == "/help":
         await send_message(chat_id, """🤖 <b>Gonka Bot v3</b>
